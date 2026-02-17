@@ -171,7 +171,7 @@ fn config_write_defaults(path: str) -> void {
     file_write_str(fd, "# auto-generated config - edit however u want\n");
     file_write_str(fd, "\n");
     file_write_str(fd, "server-port=25565\n");
-    file_write_str(fd, "motd=A GolemMC 67 Server\n");
+    file_write_str(fd, "motd=A GolemMC Server\n");
     file_write_str(fd, "max-players=67\n");
     file_write_str(fd, "world-name=world\n");
     file_write_str(fd, "seed=" + seed + "\n");

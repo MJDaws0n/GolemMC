@@ -1,0 +1,549 @@
+// ---------------------------------------------------------------------------
+// chunk.nov - chunk storage and block state tracking
+//
+// handles loading/saving chunks from disk and keeping track of block
+// changes in memory. each chunk is stored as a flat file in the world's
+// region folder with one byte per block (block state id, capped at 255)
+//
+// file format: world/region/c_X_Z.dat
+//   98304 bytes = 24 sections * 4096 blocks per section
+//   each byte = block state id (0=air, 1=stone, 9=grass_block etc)
+//   blocks ordered: y-major, then z, then x within each section
+//   sections ordered bottom (y=-64) to top (y=319)
+//
+// we keep a grid of loaded chunks in memory so the server can
+// quickly look up and modify block states without hitting disk
+// every time. saves happen on a timer or when explicitly requested
+// ---------------------------------------------------------------------------
+
+module chunk;
+
+import ../lib/standard_lib;
+import ../lib/standard_lib_macos_silicon;
+import ../lib/file_io;
+import ../lib/net;
+import ../lib/memory;
+import config;
+import logger;
+import world/terrain;
+
+// ---------------------------------------------------------------------------
+// constants - chunk dimensions and limits
+// ---------------------------------------------------------------------------
+
+// blocks per section = 16 * 16 * 16
+fn chunk_section_blocks() -> i32 { return 4096; }
+
+// sections per chunk column (overworld: y=-64 to y=319 = 384 / 16 = 24)
+fn chunk_sections() -> i32 { return 24; }
+
+// total bytes per chunk file = 24 * 4096 = 98304
+fn chunk_file_size() -> i32 { return 98304; }
+
+// how many chunks we can keep loaded at once (21x21 grid around spawn)
+fn max_loaded_chunks() -> i32 { return 441; }
+
+// ---------------------------------------------------------------------------
+// loaded chunk storage - parallel arrays cos novus doesnt have structs
+//
+// each loaded chunk has:
+//   chunk_x[i], chunk_z[i] - which chunk column it is
+//   chunk_data[i] - the block data string (98304 bytes)
+//   chunk_dirty[i] - whether it has unsaved changes
+//   chunk_used[i] - whether this slot is in use
+// ---------------------------------------------------------------------------
+
+// we use a flat string as a "byte array" for each chunk
+// and track metadata with separate arrays via index functions
+
+// chunk slot metadata - stored as a big flat buffer
+// layout per slot: 4 bytes x + 4 bytes z + 1 byte dirty + 1 byte used = 10 bytes
+// total = 441 * 10 = 4410 bytes
+let chunk_meta: str = "";
+
+// chunk block data - 441 separate strings, but we cant do arrays of strings
+// so instead we use one massive buffer: 441 * 98304 = ~43MB
+// thats way too big lol. lets use a different approach:
+// only load chunks that are actually needed, keep a small cache
+
+// actually lets be smarter about this. most chunks in a flat world
+// are identical (all stone below y=0, grass at y=0, air above)
+// we only need to store chunks that have been MODIFIED
+
+// ---------------------------------------------------------------------------
+// modified block tracking - sparse storage approach
+//
+// instead of loading full chunk data into memory, we track individual
+// block modifications in a flat list. when generating chunk data to
+// send to the client, we start with the default flat world template
+// and apply any modifications on top
+//
+// each mod entry = 16 bytes:
+//   4 bytes: world x (i32)
+//   4 bytes: world y (i32)
+//   4 bytes: world z (i32)
+//   4 bytes: block state id (i32)
+//
+// max 16384 modifications tracked (256KB buffer)
+// ---------------------------------------------------------------------------
+
+// chunk state is allocated externally (in main.nov) and passed to all functions
+// layout of the state buffer:
+//   bytes 0-3: mod count (big-endian i32)
+//   byte 4: dirty flag (0 or 1)
+//   bytes 8-11: world seed (big-endian i32)
+//   bytes 16+: block modification entries (16 bytes each)
+//   each entry: x(4) + y(4) + z(4) + block_id(4)
+//
+// no module-level globals here cos novus breaks em across modules
+
+fn chunk_alloc() -> str {
+    // 16 bytes header + 16384 entries * 16 bytes = 262160 bytes
+    let size: i32 = 262160;
+    let buf: str = net_make_buf(size + 1);
+    // zero out header
+    buf[0] = 0;
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    buf[4] = 0;
+    return buf;
+}
+
+fn chunk_init(state: str) -> void {
+    // load existing modifications from disk if they exist
+    chunk_load_mods(state);
+}
+
+// read mod count from state header
+fn cs_count(state: str) -> i32 {
+    let b0: i32 = state[0];
+    let b1: i32 = state[1];
+    let b2: i32 = state[2];
+    let b3: i32 = state[3];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+// write mod count to state header
+fn cs_set_count(state: str, v: i32) -> void {
+    state[0] = (v >> 24) & 255;
+    state[1] = (v >> 16) & 255;
+    state[2] = (v >> 8) & 255;
+    state[3] = v & 255;
+}
+
+// check/set dirty flag
+fn cs_dirty(state: str) -> bool { return state[4] != 0; }
+fn cs_set_dirty(state: str, v: bool) -> void {
+    if (v) { state[4] = 1; }
+    else { state[4] = 0; }
+}
+
+// get/set world seed (stored at bytes 8-11)
+fn cs_seed(state: str) -> i32 {
+    let b0: i32 = state[8];
+    let b1: i32 = state[9];
+    let b2: i32 = state[10];
+    let b3: i32 = state[11];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    let result: i32 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    if (b0 >= 128) {
+        result = result - 2147483647 - 2147483647 - 2;
+    }
+    return result;
+}
+fn cs_set_seed(state: str, seed: i32) -> void {
+    state[8] = (seed >> 24) & 255;
+    state[9] = (seed >> 16) & 255;
+    state[10] = (seed >> 8) & 255;
+    state[11] = seed & 255;
+}
+
+// ---------------------------------------------------------------------------
+// pack/unpack i32 to/from 4 bytes in a buffer (big-endian)
+// ---------------------------------------------------------------------------
+
+fn buf_write_i32(buf: str, offset: i32, val: i32) -> void {
+    buf[offset] = (val >> 24) & 255;
+    buf[offset + 1] = (val >> 16) & 255;
+    buf[offset + 2] = (val >> 8) & 255;
+    buf[offset + 3] = val & 255;
+}
+
+fn buf_read_i32(buf: str, offset: i32) -> i32 {
+    let b0: i32 = buf[offset];
+    let b1: i32 = buf[offset + 1];
+    let b2: i32 = buf[offset + 2];
+    let b3: i32 = buf[offset + 3];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    // reconstruct unsigned value first
+    let result: i32 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    // sign extend - if high bit (bit 31) set, its actually negative
+    // on 64-bit arch, shifts may not sign-extend, so we fix manually
+    if (b0 >= 128) {
+        // negative value - subtract 2^32 to get proper signed result
+        result = result - 2147483647 - 2147483647 - 2;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// set a block modification
+// if this position already has a mod, update it in place
+// otherwise append a new entry
+// ---------------------------------------------------------------------------
+
+fn chunk_set_block(state: str, x: i32, y: i32, z: i32, block_id: i32) -> void {
+    let count: i32 = cs_count(state);
+
+    // check if we already have a mod for this position
+    let i: i32 = 0;
+    while (i < count) {
+        let offset: i32 = 16 + i * 16;
+        let mx: i32 = buf_read_i32(state, offset);
+        let my: i32 = buf_read_i32(state, offset + 4);
+        let mz: i32 = buf_read_i32(state, offset + 8);
+        if (mx == x && my == y && mz == z) {
+            buf_write_i32(state, offset + 12, block_id);
+            cs_set_dirty(state, true);
+            return;
+        }
+        i = i + 1;
+    }
+
+    if (count >= 16384) {
+        log_warn("block modification limit reached (16384) - cant track more changes");
+        return;
+    }
+
+    let offset: i32 = 16 + count * 16;
+    buf_write_i32(state, offset, x);
+    buf_write_i32(state, offset + 4, y);
+    buf_write_i32(state, offset + 8, z);
+    buf_write_i32(state, offset + 12, block_id);
+    cs_set_count(state, count + 1);
+    cs_set_dirty(state, true);
+}
+
+// ---------------------------------------------------------------------------
+// get the block id at a world position
+// checks modifications first, falls back to terrain generation
+// ---------------------------------------------------------------------------
+
+fn chunk_get_block(state: str, x: i32, y: i32, z: i32) -> i32 {
+    let seed: i32 = cs_seed(state);
+    return chunk_get_block_seed(state, x, y, z, seed);
+}
+
+// same as chunk_get_block but takes seed directly (avoids reading from
+// potentially corrupted state buffer during gameplay net_make_buf calls)
+fn chunk_get_block_seed(state: str, x: i32, y: i32, z: i32, seed: i32) -> i32 {
+    let count: i32 = cs_count(state);
+
+    let i: i32 = 0;
+    while (i < count) {
+        let offset: i32 = 16 + i * 16;
+        let mx: i32 = buf_read_i32(state, offset);
+        let my: i32 = buf_read_i32(state, offset + 4);
+        let mz: i32 = buf_read_i32(state, offset + 8);
+        if (mx == x && my == y && mz == z) {
+            return buf_read_i32(state, offset + 12);
+        }
+        i = i + 1;
+    }
+
+    // use terrain generation with the provided seed
+    return terrain_block_at(x, y, z, seed);
+}
+
+// ---------------------------------------------------------------------------
+// default block for a given y level (used as fallback)
+// kept for compatibility but terrain gen is the main thing now
+// ---------------------------------------------------------------------------
+
+fn default_block_at(y: i32) -> i32 {
+    if (y < -60) { return BLOCK_BEDROCK(); }
+    if (y < 0) { return BLOCK_STONE(); }
+    if (y == 0) { return BLOCK_GRASS_BLOCK(); }
+    return BLOCK_AIR();
+}
+
+// ---------------------------------------------------------------------------
+// check if a chunk has any modifications
+// returns the number of mods for a given chunk
+// ---------------------------------------------------------------------------
+
+fn chunk_has_mods(state: str, chunk_x: i32, chunk_z: i32) -> i32 {
+    let count: i32 = cs_count(state);
+    let result: i32 = 0;
+    let i: i32 = 0;
+    while (i < count) {
+        let offset: i32 = 16 + i * 16;
+        let mx: i32 = buf_read_i32(state, offset);
+        let mz: i32 = buf_read_i32(state, offset + 8);
+        let cx: i32 = mx >> 4;
+        let cz: i32 = mz >> 4;
+        if (mx < 0 && (mx & 15) != 0) { cx = cx - 1; }
+        if (mz < 0 && (mz & 15) != 0) { cz = cz - 1; }
+        if (cx == chunk_x && cz == chunk_z) {
+            result = result + 1;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// get block at position within a specific chunk section
+// section_y = section index (0-23, where 0 = y=-64 to y=-49)
+// local x,y,z = 0-15 within the section
+// ---------------------------------------------------------------------------
+
+fn chunk_get_section_block(state: str, chunk_x: i32, chunk_z: i32, section_idx: i32, local_x: i32, local_y: i32, local_z: i32) -> i32 {
+    let world_x: i32 = chunk_x * 16 + local_x;
+    let world_y: i32 = (section_idx - 4) * 16 + local_y;
+    let world_z: i32 = chunk_z * 16 + local_z;
+    return chunk_get_block(state, world_x, world_y, world_z);
+}
+
+// ---------------------------------------------------------------------------
+// check if a chunk section is uniform (all same block)
+// returns the block id if uniform, or -1 if mixed
+// also counts non-air blocks for the block_count field
+// ---------------------------------------------------------------------------
+
+fn chunk_section_uniform_block(state: str, chunk_x: i32, chunk_z: i32, section_idx: i32) -> i32 {
+    let base_y: i32 = (section_idx - 4) * 16;
+    let count: i32 = cs_count(state);
+
+    // with terrain generation, most sections near the surface are mixed
+    // only sections well above or below terrain can be uniform
+    // sections above y=200 are always air (no terrain goes that high)
+    if (base_y >= 200) {
+        // check for mods in this section
+        let has_mods_high: bool = false;
+        let ih: i32 = 0;
+        while (ih < count) {
+            let offset: i32 = 16 + ih * 16;
+            let mx: i32 = buf_read_i32(state, offset);
+            let my: i32 = buf_read_i32(state, offset + 4);
+            let mz: i32 = buf_read_i32(state, offset + 8);
+            let cx: i32 = mx >> 4;
+            let cz: i32 = mz >> 4;
+            if (mx < 0 && (mx & 15) != 0) { cx = cx - 1; }
+            if (mz < 0 && (mz & 15) != 0) { cz = cz - 1; }
+            if (cx == chunk_x && cz == chunk_z && my >= base_y && my < base_y + 16) {
+                has_mods_high = true;
+            }
+            ih = ih + 1;
+        }
+        if (!has_mods_high) { return BLOCK_AIR(); }
+    }
+
+    // for all other sections, we need to check block by block
+    // since terrain generation varies by x,z position
+    // check first block then scan for differences
+    let first: i32 = chunk_get_section_block(state, chunk_x, chunk_z, section_idx, 0, 0, 0);
+    let lx: i32 = 0;
+    while (lx < 16) {
+        let ly: i32 = 0;
+        while (ly < 16) {
+            let lz: i32 = 0;
+            while (lz < 16) {
+                let b: i32 = chunk_get_section_block(state, chunk_x, chunk_z, section_idx, lx, ly, lz);
+                if (b != first) {
+                    return -1;  // mixed section
+                }
+                lz = lz + 1;
+            }
+            ly = ly + 1;
+        }
+        lx = lx + 1;
+    }
+    return first;
+}
+
+// ---------------------------------------------------------------------------
+// count non-air blocks in a section
+// ---------------------------------------------------------------------------
+
+fn chunk_section_non_air(state: str, chunk_x: i32, chunk_z: i32, section_idx: i32) -> i32 {
+    let base_y: i32 = (section_idx - 4) * 16;
+
+    // sections way above terrain are all air - quick shortcut
+    if (base_y >= 200) {
+        // check for mods first
+        let count_h: i32 = cs_count(state);
+        let has_m: bool = false;
+        let ih: i32 = 0;
+        while (ih < count_h) {
+            let off: i32 = 16 + ih * 16;
+            let mx: i32 = buf_read_i32(state, off);
+            let my: i32 = buf_read_i32(state, off + 4);
+            let mz: i32 = buf_read_i32(state, off + 8);
+            let cx: i32 = mx >> 4;
+            let cz: i32 = mz >> 4;
+            if (mx < 0 && (mx & 15) != 0) { cx = cx - 1; }
+            if (mz < 0 && (mz & 15) != 0) { cz = cz - 1; }
+            if (cx == chunk_x && cz == chunk_z && my >= base_y && my < base_y + 16) {
+                has_m = true;
+            }
+            ih = ih + 1;
+        }
+        if (!has_m) { return 0; }
+    }
+
+    // count non-air blocks the slow way (terrain varies by x,z)
+    let na_count: i32 = 0;
+    let lx: i32 = 0;
+    while (lx < 16) {
+        let ly: i32 = 0;
+        while (ly < 16) {
+            let lz: i32 = 0;
+            while (lz < 16) {
+                let b: i32 = chunk_get_section_block(state, chunk_x, chunk_z, section_idx, lx, ly, lz);
+                if (b != 0) {
+                    na_count = na_count + 1;
+                }
+                lz = lz + 1;
+            }
+            ly = ly + 1;
+        }
+        lx = lx + 1;
+    }
+    return na_count;
+}
+
+// ---------------------------------------------------------------------------
+// save all block modifications to disk
+// file format: 4 bytes (count) + count * 16 bytes (entries)
+// ---------------------------------------------------------------------------
+
+fn chunk_save(state: str) -> bool {
+    if (!cs_dirty(state)) {
+        return true;
+    }
+
+    let world_name: str = config_get_world_name();
+
+    let region_dir: str = world_name + "/region";
+    sys_mkdir(region_dir, 493);
+
+    let path: str = region_dir + "/blocks.dat";
+    let fd: i32 = file_open_write(path);
+    if (fd < 0) {
+        log_error("failed to save world data to " + path);
+        return false;
+    }
+
+    let count: i32 = cs_count(state);
+
+    // write count as 4 bytes
+    let header: str = net_make_buf(5);
+    header[0] = (count >> 24) & 255;
+    header[1] = (count >> 16) & 255;
+    header[2] = (count >> 8) & 255;
+    header[3] = count & 255;
+    file_write(fd, ptr(header), 4);
+
+    // write all entries (from offset 16 in state buffer)
+    if (count > 0) {
+        let data_size: i32 = count * 16;
+        // need to write from state + 16 offset
+        // get pointer to state buffer and add 16
+        let base_ptr: u64 = ptr(state);
+        let data_ptr: u64 = base_ptr + 16;
+        file_write(fd, data_ptr, data_size);
+    }
+
+    file_close(fd);
+    cs_set_dirty(state, false);
+    log_info("world saved (" + i32_to_str(count) + " block changes)");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// load block modifications from disk
+// ---------------------------------------------------------------------------
+
+fn chunk_load_mods(state: str) -> void {
+    let world_name: str = config_get_world_name();
+    let path: str = world_name + "/region/blocks.dat";
+
+    if (!file_exists(path)) {
+        log_debug("no saved block data found - starting fresh");
+        return;
+    }
+
+    let fd: i32 = file_open_read(path);
+    if (fd < 0) {
+        log_warn("couldnt open " + path + " for reading");
+        return;
+    }
+
+    // read the count header (4 bytes)
+    let header: str = net_make_buf(5);
+    let nr: i32 = file_read(fd, ptr(header), 4);
+    if (nr < 4) {
+        log_warn("block data file too small");
+        file_close(fd);
+        return;
+    }
+
+    let b0: i32 = header[0];
+    let b1: i32 = header[1];
+    let b2: i32 = header[2];
+    let b3: i32 = header[3];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    let count: i32 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+
+    if (count < 0 || count > 16384) {
+        log_warn("block data file has invalid count: " + i32_to_str(count));
+        file_close(fd);
+        return;
+    }
+
+    // read all entries into state buffer at offset 16
+    if (count > 0) {
+        let data_size: i32 = count * 16;
+        let base_ptr: u64 = ptr(state);
+        let data_ptr: u64 = base_ptr + 16;
+        let nr2: i32 = file_read(fd, data_ptr, data_size);
+        if (nr2 < data_size) {
+            log_warn("block data file truncated - loaded partial data");
+        }
+    }
+
+    cs_set_count(state, count);
+    file_close(fd);
+    log_info("loaded " + i32_to_str(count) + " block changes from disk");
+}
+
+// ---------------------------------------------------------------------------
+// get current block modification count (for status display)
+// ---------------------------------------------------------------------------
+
+fn chunk_get_mod_count(state: str) -> i32 {
+    return cs_count(state);
+}
+
+// ---------------------------------------------------------------------------
+// check if world has unsaved changes
+// ---------------------------------------------------------------------------
+
+fn chunk_is_dirty(state: str) -> bool {
+    return cs_dirty(state);
+}

@@ -71,10 +71,10 @@ fn wait_login_acknowledged(fd: i32) -> bool {
     let pkt_len: i32 = unpack_varint_value(pkt_packed);
     if (pkt_len <= 0) { return false; }
 
-    // read the packet data
+    // read the packet data (MUST be exact - TCP can split packets)
     let buf: str = net_make_buf(pkt_len + 1);
-    let nr: i32 = net_read(fd, buf, pkt_len);
-    if (nr <= 0) { return false; }
+    let ok: bool = read_exact(fd, buf, pkt_len);
+    if (!ok) { return false; }
 
     // parse packet id
     let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);

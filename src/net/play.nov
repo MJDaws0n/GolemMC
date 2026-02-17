@@ -3,10 +3,10 @@
 //
 // once a player is through login + config, they enter the play state
 // this is where we send em the world data, spawn em in, and handle
-// all the gameplay packets like movement, chat, block interaction etc
+// all the gameplay packets like movement, chat, block breaks/places etc
 //
-// for now we just send the minimum packets to get them spawned in
-// a flat world and able to look around. baby steps innit
+// chunks are now generated from the chunk storage system which tracks
+// block modifications on top of the default flat world template
 // ---------------------------------------------------------------------------
 
 module play;
@@ -14,6 +14,8 @@ module play;
 import ../../lib/standard_lib;
 import ../../lib/standard_lib_macos_silicon;
 import ../../lib/net;
+import ../chunk;
+import ../world/terrain;
 import packet;
 import writer;
 
@@ -233,86 +235,295 @@ fn send_center_chunk(fd: i32, chunk_x: i32, chunk_z: i32) -> void {
 // grass at y=0, air above. a 1-layer grass world
 // ---------------------------------------------------------------------------
 
-fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32) -> void {
+fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str) -> void {
     // Chunk Data and Update Light packet (0x2C in protocol 774)
     //
-    // Format for 1.21.11:
-    // - Chunk X: i32
-    // - Chunk Z: i32
-    // - Heightmaps: Prefixed Array of Heightmap structs (we send 0 = empty)
-    // - Size: VarInt (length of chunk section data)
-    // - Data: byte array (chunk sections)
-    // - Block Entity Count: VarInt (0 for us)
-    // - Light data (BitSets + arrays)
+    // builds chunk section data from the chunk storage system
+    // terrain gen is expensive so we cache each section's blocks
+    // in a temp buffer to avoid scanning multiple times
     //
-    // IMPORTANT: as of 1.21.5, single-value palette sections do NOT send
-    // a data array length varint anymore. the format is just:
-    //   block_count (i16) + bpe (u8=0) + palette_value (varint)
-    //   + bpe (u8=0) + biome_value (varint)
-    // no VarInt(0) for empty data arrays!
+    // for 1.21.5+: single-value palette sections dont send data arrays
+    // mixed sections use indirect palette with packed data
 
-    let air_id: i32 = 0;
-    let stone_id: i32 = 1;
-    let grass_id: i32 = 9;
-
-    // build chunk section data into a buffer
-    // single-value section = 2 (block_count) + 1 (bpe) + varint(id) + 1 (bpe) + varint(biome)
-    // = 6 bytes per section (with small varints), 24 sections = 144 bytes
-    let max_section_size: i32 = 200;
-    let section_buf: str = net_make_buf(max_section_size);
+    // === USE PRE-ALLOCATED WORK BUFFER to avoid novus memory corruption ===
+    // partition: [0..131071] = section_buf, [131072..139263] = block_cache, [139264..139775] = palette
+    let section_buf: str = wb;
     let pos: i32 = 0;
 
+    // block cache offset in the work buffer: 131072
+    let cache_off: i32 = 131072;
+    // palette offset in the work buffer: 139264
+    let pal_off: i32 = 139264;
+
     // 24 sections for overworld (y -64 to 319)
-    // sections 0-3 (y -64 to -1): stone
-    // section 4 (y 0 to 15): grass blocks (testing flat world)
-    // sections 5-23 (y 16 to 319): air
     let section: i32 = 0;
     while (section < 24) {
-        if (section < 4) {
-            // stone section - block count = 4096 = 0x1000
-            section_buf[pos] = 16;
+        let base_y: i32 = (section - 4) * 16;
+
+        // === SINGLE PASS: fill block cache, build palette, count non-air ===
+        let pal_count: i32 = 0;
+        let non_air: i32 = 0;
+
+        // shortcut for sections way above terrain (all air)
+        let is_high_air: bool = false;
+        if (base_y >= 200) {
+            // check no modifications in this section
+            let count: i32 = cs_count(cs);
+            let has_mods_h: bool = false;
+            let ih: i32 = 0;
+            while (ih < count) {
+                let off: i32 = 16 + ih * 16;
+                let mx: i32 = buf_read_i32(cs, off);
+                let my: i32 = buf_read_i32(cs, off + 4);
+                let mz: i32 = buf_read_i32(cs, off + 8);
+                let cx: i32 = mx >> 4;
+                let cz: i32 = mz >> 4;
+                if (mx < 0 && (mx & 15) != 0) { cx = cx - 1; }
+                if (mz < 0 && (mz & 15) != 0) { cz = cz - 1; }
+                if (cx == chunk_x && cz == chunk_z && my >= base_y && my < base_y + 16) {
+                    has_mods_h = true;
+                }
+                ih = ih + 1;
+            }
+            if (!has_mods_h) { is_high_air = true; }
+        }
+
+        if (is_high_air) {
+            // all air - single value palette
+            section_buf[pos] = 0;
             pos = pos + 1;
             section_buf[pos] = 0;
             pos = pos + 1;
-            // block states: bpe=0, palette=stone (no data array in 1.21.5+)
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = stone_id;
-            pos = pos + 1;
-            // biomes: bpe=0, palette=0 (plains)
             section_buf[pos] = 0;
             pos = pos + 1;
             section_buf[pos] = 0;
             pos = pos + 1;
-        } else if (section == 4) {
-            // grass section - block count = 4096
-            section_buf[pos] = 16;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = grass_id;
-            pos = pos + 1;
+            // biomes
             section_buf[pos] = 0;
             pos = pos + 1;
             section_buf[pos] = 0;
             pos = pos + 1;
         } else {
-            // air section - block count = 0
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = air_id;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
-            section_buf[pos] = 0;
-            pos = pos + 1;
+            // fill block cache for this section
+            let lx: i32 = 0;
+            while (lx < 16) {
+                let ly: i32 = 0;
+                while (ly < 16) {
+                    let lz: i32 = 0;
+                    while (lz < 16) {
+                        let bid: i32 = chunk_get_section_block(cs, chunk_x, chunk_z, section, lx, ly, lz);
+                        if (bid != 0) { non_air = non_air + 1; }
+
+                        // store in cache: index = (ly * 256 + lz * 16 + lx) * 2
+                        let ci: i32 = cache_off + (ly * 256 + lz * 16 + lx) * 2;
+                        wb[ci] = bid & 255;
+                        wb[ci + 1] = (bid >> 8) & 255;
+
+                        // add to palette if not already there
+                        let found: bool = false;
+                        let pi: i32 = 0;
+                        while (pi < pal_count) {
+                            let po: i32 = pal_off + pi * 2;
+                            let pb0: i32 = wb[po];
+                            let pb1: i32 = wb[po + 1];
+                            if (pb0 < 0) { pb0 = pb0 + 256; }
+                            if (pb1 < 0) { pb1 = pb1 + 256; }
+                            let pal_val: i32 = pb0 | (pb1 << 8);
+                            if (pal_val == bid) {
+                                found = true;
+                            }
+                            pi = pi + 1;
+                        }
+                        if (!found && pal_count < 256) {
+                            let po2: i32 = pal_off + pal_count * 2;
+                            wb[po2] = bid & 255;
+                            wb[po2 + 1] = (bid >> 8) & 255;
+                            pal_count = pal_count + 1;
+                        }
+                        lz = lz + 1;
+                    }
+                    ly = ly + 1;
+                }
+                lx = lx + 1;
+            }
+
+            if (pal_count <= 1) {
+                // uniform section - single-value palette
+                let uniform_id: i32 = 0;
+                if (pal_count == 1) {
+                    let up0: i32 = wb[pal_off];
+                    let up1: i32 = wb[pal_off + 1];
+                    if (up0 < 0) { up0 = up0 + 256; }
+                    if (up1 < 0) { up1 = up1 + 256; }
+                    uniform_id = up0 | (up1 << 8);
+                }
+
+                // block count
+                section_buf[pos] = (non_air >> 8) & 255;
+                pos = pos + 1;
+                section_buf[pos] = non_air & 255;
+                pos = pos + 1;
+
+                // bpe=0, palette=block_id
+                section_buf[pos] = 0;
+                pos = pos + 1;
+                if (uniform_id < 128) {
+                    section_buf[pos] = uniform_id;
+                    pos = pos + 1;
+                } else if (uniform_id < 16384) {
+                    section_buf[pos] = (uniform_id & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = (uniform_id >> 7) & 127;
+                    pos = pos + 1;
+                } else {
+                    section_buf[pos] = (uniform_id & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = ((uniform_id >> 7) & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = (uniform_id >> 14) & 127;
+                    pos = pos + 1;
+                }
+
+                // biomes
+                section_buf[pos] = 0;
+                pos = pos + 1;
+                section_buf[pos] = 0;
+                pos = pos + 1;
+            } else {
+                // mixed section - indirect palette
+                let bpe: i32 = 4;
+                if (pal_count > 16) { bpe = 5; }
+                if (pal_count > 32) { bpe = 6; }
+                if (pal_count > 64) { bpe = 7; }
+                if (pal_count > 128) { bpe = 8; }
+
+                // block count
+                section_buf[pos] = (non_air >> 8) & 255;
+                pos = pos + 1;
+                section_buf[pos] = non_air & 255;
+                pos = pos + 1;
+
+                // bits per entry
+                section_buf[pos] = bpe;
+                pos = pos + 1;
+
+                // palette length
+                if (pal_count < 128) {
+                    section_buf[pos] = pal_count;
+                    pos = pos + 1;
+                } else {
+                    section_buf[pos] = (pal_count & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = (pal_count >> 7) & 127;
+                    pos = pos + 1;
+                }
+
+                // palette entries
+                let pi2: i32 = 0;
+                while (pi2 < pal_count) {
+                    let po3: i32 = pal_off + pi2 * 2;
+                    let ppb0: i32 = wb[po3];
+                    let ppb1: i32 = wb[po3 + 1];
+                    if (ppb0 < 0) { ppb0 = ppb0 + 256; }
+                    if (ppb1 < 0) { ppb1 = ppb1 + 256; }
+                    let pid: i32 = ppb0 | (ppb1 << 8);
+                    if (pid < 128) {
+                        section_buf[pos] = pid;
+                        pos = pos + 1;
+                    } else if (pid < 16384) {
+                        section_buf[pos] = (pid & 127) | 128;
+                        pos = pos + 1;
+                        section_buf[pos] = (pid >> 7) & 127;
+                        pos = pos + 1;
+                    } else {
+                        section_buf[pos] = (pid & 127) | 128;
+                        pos = pos + 1;
+                        section_buf[pos] = ((pid >> 7) & 127) | 128;
+                        pos = pos + 1;
+                        section_buf[pos] = (pid >> 14) & 127;
+                        pos = pos + 1;
+                    }
+                    pi2 = pi2 + 1;
+                }
+
+                // data array - pack block palette indices into longs from cache
+                let entries_per_long: i32 = 64 / bpe;
+                let num_longs: i32 = (4096 + entries_per_long - 1) / entries_per_long;
+
+                let entry_idx: i32 = 0;
+                let long_idx: i32 = 0;
+                while (long_idx < num_longs) {
+                    let b0: i32 = 0;
+                    let b1: i32 = 0;
+
+                    let slot: i32 = 0;
+                    while (slot < entries_per_long && entry_idx < 4096) {
+                        // read block from cache instead of calling terrain gen again
+                        let ey: i32 = entry_idx / 256;
+                        let ez: i32 = (entry_idx / 16) % 16;
+                        let ex: i32 = entry_idx % 16;
+                        let ci2: i32 = cache_off + (ey * 256 + ez * 16 + ex) * 2;
+                        let cv0: i32 = wb[ci2];
+                        let cv1: i32 = wb[ci2 + 1];
+                        if (cv0 < 0) { cv0 = cv0 + 256; }
+                        if (cv1 < 0) { cv1 = cv1 + 256; }
+                        let bid2: i32 = cv0 | (cv1 << 8);
+
+                        // find palette index
+                        let pal_idx: i32 = 0;
+                        let pi3: i32 = 0;
+                        while (pi3 < pal_count) {
+                            let po4: i32 = pal_off + pi3 * 2;
+                            let pv0: i32 = wb[po4];
+                            let pv1: i32 = wb[po4 + 1];
+                            if (pv0 < 0) { pv0 = pv0 + 256; }
+                            if (pv1 < 0) { pv1 = pv1 + 256; }
+                            let pval: i32 = pv0 | (pv1 << 8);
+                            if (pval == bid2) {
+                                pal_idx = pi3;
+                            }
+                            pi3 = pi3 + 1;
+                        }
+
+                        // pack into the long at bit position
+                        let bit_pos: i32 = slot * bpe;
+                        if (bit_pos < 32) {
+                            if (bit_pos + bpe <= 32) {
+                                b0 = b0 | (pal_idx << bit_pos);
+                            } else {
+                                b0 = b0 | (pal_idx << bit_pos);
+                                b1 = b1 | (pal_idx >> (32 - bit_pos));
+                            }
+                        } else {
+                            b1 = b1 | (pal_idx << (bit_pos - 32));
+                        }
+
+                        slot = slot + 1;
+                        entry_idx = entry_idx + 1;
+                    }
+
+                    // write as big-endian i64
+                    section_buf[pos] = (b1 >> 24) & 255;
+                    section_buf[pos + 1] = (b1 >> 16) & 255;
+                    section_buf[pos + 2] = (b1 >> 8) & 255;
+                    section_buf[pos + 3] = b1 & 255;
+                    section_buf[pos + 4] = (b0 >> 24) & 255;
+                    section_buf[pos + 5] = (b0 >> 16) & 255;
+                    section_buf[pos + 6] = (b0 >> 8) & 255;
+                    section_buf[pos + 7] = b0 & 255;
+                    pos = pos + 8;
+
+                    long_idx = long_idx + 1;
+                }
+
+                // biomes
+                section_buf[pos] = 0;
+                pos = pos + 1;
+                section_buf[pos] = 0;
+                pos = pos + 1;
+            }
         }
+
         section = section + 1;
     }
 
@@ -387,7 +598,7 @@ fn send_chunk_batch_finished(fd: i32, batch_size: i32) -> void {
 // for now we send a small area around 0,0
 // ---------------------------------------------------------------------------
 
-fn send_spawn_chunks(fd: i32, view_distance: i32) -> void {
+fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str) -> void {
     // send center chunk first
     send_center_chunk(fd, 0, 0);
 
@@ -405,7 +616,7 @@ fn send_spawn_chunks(fd: i32, view_distance: i32) -> void {
     while (cx <= radius) {
         let cz: i32 = 0 - radius;
         while (cz <= radius) {
-            send_chunk_data(fd, cx, cz);
+            send_chunk_data(fd, cx, cz, cs, wb);
             chunk_count = chunk_count + 1;
             cz = cz + 1;
         }
@@ -420,7 +631,7 @@ fn send_spawn_chunks(fd: i32, view_distance: i32) -> void {
 // returns the entity id assigned to the player
 // ---------------------------------------------------------------------------
 
-fn send_play_login(fd: i32, entity_id: i32) -> void {
+fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str) -> void {
     // 1. send login (play) packet
     send_login_play(fd, entity_id);
 
@@ -428,14 +639,18 @@ fn send_play_login(fd: i32, entity_id: i32) -> void {
     // value is the wait percentage as float bits... 0 means start
     send_game_event(fd, 13, 0);
 
-    // 3. set default spawn position (on top of the grass section at y=16)
-    send_spawn_position(fd, 0, 16, 0);
+    // 3. figure out spawn height from terrain generation
+    let spawn_seed: i32 = cs_seed(cs);
+    let spawn_y: i32 = terrain_height(0, 0, spawn_seed) + 1;
+
+    // 3. set default spawn position
+    send_spawn_position(fd, 0, spawn_y, 0);
 
     // 4. send chunks around spawn
-    send_spawn_chunks(fd, 3);
+    send_spawn_chunks(fd, 3, cs, wb);
 
-    // 5. teleport player to spawn (y=17 so theyre standing on the grass)
-    send_player_position(fd, 0, 17, 0, 1);
+    // 5. teleport player to spawn (on top of the terrain)
+    send_player_position(fd, 0, spawn_y + 1, 0, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,9 +658,19 @@ fn send_play_login(fd: i32, entity_id: i32) -> void {
 // returns false if the client disconnected
 // ---------------------------------------------------------------------------
 
-fn handle_play_packet(fd: i32) -> bool {
+fn handle_play_packet(fd: i32, cs: str, world_seed: i32) -> bool {
     let ready: i32 = net_poll_read(fd, 100);
-    if (ready <= 0) { return true; }  // no data yet, still connected
+    if (ready < 0) { return false; }   // POLLHUP/POLLERR = disconnected
+    if (ready == 0) { return true; }   // timeout, no data yet, still connected
+
+    // poll says readable - but on macOS we need to verify theres actual data
+    // cos poll can wake up with POLLIN + POLLHUP simultaneously on close
+    // and net_read returns errno (positive) instead of -1 on error
+    let avail: i32 = net_bytes_available(fd);
+    if (avail <= 0) {
+        // poll says readable but no bytes -> graceful close (EOF)
+        return false;
+    }
 
     let pkt_packed: i32 = read_varint_from_fd(fd);
     if (pkt_packed < 0) { return false; }
@@ -474,42 +699,266 @@ fn handle_play_packet(fd: i32) -> bool {
     let packet_id: i32 = unpack_varint_value(id_packed);
 
     // handle known play packets (serverbound IDs for 1.21.11 protocol 774)
+    let id_size: i32 = unpack_varint_size(id_packed);
+
     if (packet_id == 0) {
         // 0x00 - Confirm Teleportation (accept_teleportation)
-        // client confirms they received our position sync
-        // we dont need to do anything with this rn
     } else if (packet_id == 8) {
         // 0x08 - Chat Message
-        // player sent a chat message
     } else if (packet_id == 10) {
         // 0x0A - Chunk Batch Received
-        // client acks chunk batch, sends desired chunks per tick (float)
-        // we can ignore this for now
     } else if (packet_id == 27) {
         // 0x1B - Keep Alive (serverbound)
-        // client responding to our keep alive - all good
     } else if (packet_id == 29) {
         // 0x1D - Set Player Position (move_player_pos)
-        // client moved - track this for multiplayer later
     } else if (packet_id == 30) {
         // 0x1E - Set Player Position and Rotation (move_player_pos_rot)
-        // movement + looking
     } else if (packet_id == 31) {
         // 0x1F - Set Player Rotation (move_player_rot)
-        // just looking around
     } else if (packet_id == 32) {
         // 0x20 - Set Player Movement Flags (move_player_status_only)
-        // client reporting ground state
     } else if (packet_id == 12) {
         // 0x0C - Client Tick End (client_tick_end)
-        // sent every tick by the client, no fields
     } else if (packet_id == 13) {
         // 0x0D - Client Information (client_information) play state
-        // client settings like render distance, chat mode etc
+    } else if (packet_id == 40) {
+        // 0x28 - Player Action (player_action)
+        // this is block breaking, eating, shield etc
+        // format: VarInt status, Position location, VarInt face, VarInt sequence
+        handle_player_action(fd, buf, id_size, pkt_len, cs, world_seed);
+    } else if (packet_id == 63) {
+        // 0x3F - Use Item On (use_item_on)
+        // block placement
+        handle_use_item_on(fd, buf, id_size, pkt_len, cs, world_seed);
     }
 
-    // for now we just eat all packets and stay alive
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// send Block Update packet (0x08) to tell the client a block changed
+// ---------------------------------------------------------------------------
+
+fn send_block_update(fd: i32, x: i32, y: i32, z: i32, block_id: i32) -> void {
+    // Block Update (0x08): Position + VarInt block_state_id
+    let pkt_id: i32 = 8;  // 0x08 Block Update
+    let id_len: i32 = varint_size(pkt_id);
+    let block_vi: i32 = varint_size(block_id);
+    let total: i32 = id_len + 8 + block_vi;  // 8 for packed position
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_position(fd, x, y, z);
+    write_varint_to_fd(fd, block_id);
+}
+
+// ---------------------------------------------------------------------------
+// send Block Changed Ack (0x04) - confirms we processed a block sequence
+// ---------------------------------------------------------------------------
+
+fn send_block_changed_ack(fd: i32, sequence: i32) -> void {
+    let pkt_id: i32 = 4;  // 0x04 Block Changed Ack
+    let id_len: i32 = varint_size(pkt_id);
+    let seq_vi: i32 = varint_size(sequence);
+    let total: i32 = id_len + seq_vi;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_varint_to_fd(fd, sequence);
+}
+
+// ---------------------------------------------------------------------------
+// decode a packed position (i64) from buffer into x, y, z
+// returns packed: x in high bits, then z, then y
+// position = ((x & 0x3FFFFFF) << 38) | ((z & 0x3FFFFFF) << 12) | (y & 0xFFF)
+// ---------------------------------------------------------------------------
+
+fn decode_position_x(buf: str, offset: i32) -> i32 {
+    let b0: i32 = buf[offset];
+    let b1: i32 = buf[offset + 1];
+    let b2: i32 = buf[offset + 2];
+    let b3: i32 = buf[offset + 3];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    // x is in bits 63-38 = top 26 bits of the i64
+    // high word bits 31-6
+    let high: i32 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    let x: i32 = high >> 6;
+    // sign extend from 26 bits
+    if (x >= 33554432) { x = x - 67108864; }
+    return x;
+}
+
+fn decode_position_y(buf: str, offset: i32) -> i32 {
+    let b6: i32 = buf[offset + 6];
+    let b7: i32 = buf[offset + 7];
+    if (b6 < 0) { b6 = b6 + 256; }
+    if (b7 < 0) { b7 = b7 + 256; }
+    // y is in bits 11-0 = bottom 12 bits of the i64
+    let b5: i32 = buf[offset + 5];
+    if (b5 < 0) { b5 = b5 + 256; }
+    let y: i32 = ((b5 & 15) << 8) | (b6 << 0);
+    // wait, lets recalculate. the low 32 bits are bytes 4-7
+    let b4: i32 = buf[offset + 4];
+    if (b4 < 0) { b4 = b4 + 256; }
+    let low: i32 = (b4 << 24) | (b5 << 16) | (b6 << 8) | b7;
+    y = low & 4095;
+    // sign extend from 12 bits
+    if (y >= 2048) { y = y - 4096; }
+    return y;
+}
+
+fn decode_position_z(buf: str, offset: i32) -> i32 {
+    let b0: i32 = buf[offset];
+    let b1: i32 = buf[offset + 1];
+    let b2: i32 = buf[offset + 2];
+    let b3: i32 = buf[offset + 3];
+    let b4: i32 = buf[offset + 4];
+    let b5: i32 = buf[offset + 5];
+    let b6: i32 = buf[offset + 6];
+    let b7: i32 = buf[offset + 7];
+    if (b0 < 0) { b0 = b0 + 256; }
+    if (b1 < 0) { b1 = b1 + 256; }
+    if (b2 < 0) { b2 = b2 + 256; }
+    if (b3 < 0) { b3 = b3 + 256; }
+    if (b4 < 0) { b4 = b4 + 256; }
+    if (b5 < 0) { b5 = b5 + 256; }
+    if (b6 < 0) { b6 = b6 + 256; }
+    if (b7 < 0) { b7 = b7 + 256; }
+    // z is in bits 37-12 = 26 bits
+    // low word bits 31-12 = z bits 19-0
+    let low: i32 = (b4 << 24) | (b5 << 16) | (b6 << 8) | b7;
+    let z_low: i32 = (low >> 12) & 1048575;  // 20 bits
+    // high word bits 5-0 = z bits 25-20
+    let high: i32 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    let z_high: i32 = high & 63;  // 6 bits
+    let z: i32 = (z_high << 20) | z_low;
+    // sign extend from 26 bits
+    if (z >= 33554432) { z = z - 67108864; }
+    return z;
+}
+
+// ---------------------------------------------------------------------------
+// handle Player Action packet (0x28 / id 40)
+// status 0 = started digging, 1 = cancelled, 2 = finished digging
+// for creative mode, status 0 = instant break
+// ---------------------------------------------------------------------------
+
+fn handle_player_action(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, world_seed: i32) -> void {
+    let pos: i32 = id_size;
+
+    // read status (VarInt)
+    let status_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let status: i32 = unpack_varint_value(status_packed);
+    let status_size: i32 = unpack_varint_size(status_packed);
+    pos = pos + status_size;
+
+    // read position (8 bytes packed i64)
+    if (pos + 8 > pkt_len) { return; }
+    let bx: i32 = decode_position_x(buf, pos);
+    let by: i32 = decode_position_y(buf, pos);
+    let bz: i32 = decode_position_z(buf, pos);
+    pos = pos + 8;
+
+    // read face (VarInt)
+    let face_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let face: i32 = unpack_varint_value(face_packed);
+    let face_size: i32 = unpack_varint_size(face_packed);
+    pos = pos + face_size;
+
+    // read sequence (VarInt)
+    let seq_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let sequence: i32 = unpack_varint_value(seq_packed);
+
+    if (status == 0) {
+        let old_block: i32 = chunk_get_block_seed(cs, bx, by, bz, world_seed);
+        log_debug("creative break check");
+        if (old_block != 0) {
+            chunk_set_block(cs, bx, by, bz, 0);
+            send_block_update(fd, bx, by, bz, 0);
+            log_debug("block broken (creative)");
+        } else {
+            log_debug("block was air - nothing to break");
+        }
+        send_block_changed_ack(fd, sequence);
+    } else if (status == 2) {
+        let old_block2: i32 = chunk_get_block_seed(cs, bx, by, bz, world_seed);
+        if (old_block2 != 0) {
+            chunk_set_block(cs, bx, by, bz, 0);
+            send_block_update(fd, bx, by, bz, 0);
+            log_debug("block broken (survival)");
+        }
+        send_block_changed_ack(fd, sequence);
+    } else if (status == 1) {
+        send_block_changed_ack(fd, sequence);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handle Use Item On packet (0x3F / id 63)
+// this is block placement
+// format: VarInt hand, Position location, VarInt face,
+//         float cursor_x, float cursor_y, float cursor_z,
+//         bool inside_block, bool world_border_hit, VarInt sequence
+// ---------------------------------------------------------------------------
+
+fn handle_use_item_on(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, world_seed: i32) -> void {
+    let pos: i32 = id_size;
+
+    // read hand (VarInt)
+    let hand_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let hand: i32 = unpack_varint_value(hand_packed);
+    let hand_size: i32 = unpack_varint_size(hand_packed);
+    pos = pos + hand_size;
+
+    // read position (8 bytes packed i64) - the block we clicked ON
+    if (pos + 8 > pkt_len) { return; }
+    let bx: i32 = decode_position_x(buf, pos);
+    let by: i32 = decode_position_y(buf, pos);
+    let bz: i32 = decode_position_z(buf, pos);
+    pos = pos + 8;
+
+    // read face (VarInt) - which face of the block was clicked
+    // 0=bottom, 1=top, 2=north, 3=south, 4=west, 5=east
+    let face_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let face: i32 = unpack_varint_value(face_packed);
+    let face_size: i32 = unpack_varint_size(face_packed);
+    pos = pos + face_size;
+
+    // skip cursor_x, cursor_y, cursor_z (3 floats = 12 bytes)
+    pos = pos + 12;
+
+    // skip inside_block (1 byte) and world_border_hit (1 byte)
+    pos = pos + 2;
+
+    // read sequence (VarInt)
+    if (pos >= pkt_len) { return; }
+    let seq_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let sequence: i32 = unpack_varint_value(seq_packed);
+
+    // calculate the position where the new block goes
+    // its adjacent to the clicked block on the clicked face
+    let nx: i32 = bx;
+    let ny: i32 = by;
+    let nz: i32 = bz;
+    if (face == 0) { ny = by - 1; }       // bottom
+    else if (face == 1) { ny = by + 1; }   // top
+    else if (face == 2) { nz = bz - 1; }   // north
+    else if (face == 3) { nz = bz + 1; }   // south
+    else if (face == 4) { nx = bx - 1; }   // west
+    else if (face == 5) { nx = bx + 1; }   // east
+
+    // place a stone block (id 1) for now - proper inventory system later
+    // only place if the target position is currently air
+    let current: i32 = chunk_get_block(cs, nx, ny, nz);
+    if (current == 0) {
+        chunk_set_block(cs, nx, ny, nz, 1);
+        send_block_update(fd, nx, ny, nz, 1);
+        log_debug("block placed");
+    }
+    send_block_changed_ack(fd, sequence);
 }
 
 // ---------------------------------------------------------------------------

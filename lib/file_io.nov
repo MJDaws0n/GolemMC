@@ -228,3 +228,50 @@ fn file_delete(path: str) -> i32 {
     syscall();
     return u64_to_i32(getreg(x0));
 }
+
+// ---------------------------------------------------------------------------
+// change directory using chdir() syscall
+// returns 0 on success
+// ---------------------------------------------------------------------------
+
+fn file_chdir(path: str) -> i32 {
+    mov(x0, path);
+    mov(x16, 0x200000C);  // SYS_chdir = 12
+    syscall();
+    return u64_to_i32(getreg(x0));
+}
+
+// ---------------------------------------------------------------------------
+// extract the directory part from a file path
+// e.g. "/foo/bar/baz" -> "/foo/bar"
+// if no slash found, returns "."
+// ---------------------------------------------------------------------------
+
+fn path_dir(path: str) -> str {
+    let last_slash: i32 = -1;
+    let i: i32 = 0;
+    let slen: i32 = len(path);
+    while (i < slen) {
+        if (path[i] == 47) {  // '/'
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+    if (last_slash < 0) {
+        return ".";
+    }
+    if (last_slash == 0) {
+        return "/";
+    }
+    // build substring up to (not including) the last slash
+    let result: str = "";
+    let j: i32 = 0;
+    while (j < last_slash) {
+        // append one char at a time (novus string concat)
+        let ch: str = " ";
+        ch[0] = path[j];
+        result = result + ch;
+        j = j + 1;
+    }
+    return result;
+}

@@ -37,3 +37,35 @@ this isnt really a compiler bug but more of a missing feature. on macOS ARM64, s
 ## 7. no inline assembly
 
 **STATUS: BY DESIGN** - the user confirmed this isnt a bug, its just not how novus is designed. assembly-level stuff should go in library files instead.
+
+## 8. null bytes in strings get corrupted
+
+**STATUS: OPEN** - when you build a string by concatenating null bytes (`buf = buf + "\0"`), the resulting string doesnt reliably contain zeroes at every position. the `net_make_buf()` function does `buf = buf + "\0"` in a loop to create a zero-filled buffer, but when you later index into it, some positions that should be zero read back as non-zero values (we saw them come back as 0x07 consistently). this caused every embedded binary payload in our server to be silently corrupted at null byte positions.
+
+**workaround**: dont rely on zero-initialization. explicitly set EVERY byte in the buffer, including the ones that should be zero. this adds more lines of code but guarantees correctness.
+
+## 9. string operations corrupt other buffers in memory
+
+**STATUS: OPEN** - when you allocate a buffer with `net_make_buf()` and then later do string concatenation operations (like building a debug log message with `"prefix " + i32_to_str(x) + " suffix"`), the concatenation can overwrite memory belonging to previously allocated buffers. we found this when debug logging inside chunk data building - the log message text literally appeared inside our chunk data buffer, corrupting the binary data we were carefully constructing.
+
+**workaround**: avoid ALL string operations (concatenation, `log_debug` with `+`, `i32_to_str`, etc) while you have live buffers that you're still writing to. do all your logging/string work BEFORE or AFTER the buffer building, never during. if you absolutely need debug output during buffer operations, use a separate pre-built static string instead of concatenation.
+
+## 10. bit shift operations dont sign-extend on 64-bit architecture
+
+**STATUS: OPEN** - when you do `(255 << 24)` in an i32 variable, the result should be `0xFF000000` which is `-16777216` as a signed 32-bit integer. but novus seems to treat this as `0x00000000FF000000` (unsigned 64-bit), giving `4278190080` instead. this means reconstructing signed 32-bit values from individual bytes using shifts and OR doesnt produce negative numbers - `0xFFFFFFFF` comes out as `4294967295` instead of `-1`.
+
+**workaround**: after reconstructing a value from bytes, check if the high bit is set (byte 0 >= 128) and manually subtract 2^32 to get the correct signed value: `result = result - 2147483647 - 2147483647 - 2`.
+
+## 11. net_make_buf corrupts previously allocated heap strings
+
+**STATUS: OPEN** - calling `net_make_buf()` (which does O(n) string concatenations internally) can corrupt the memory of PREVIOUSLY allocated strings that are still in use. this is different from bug #9 - its not about concurrent string ops on the same buffer, its about allocating a NEW buffer corrupting OLD ones.
+
+specifically: if you allocate a 262KB buffer A at startup, then later during gameplay allocate a 140KB buffer B with `net_make_buf()`, the intermediate strings created during B's allocation can overwrite bytes in A. we confirmed this by observing that the seed value (stored at bytes 8-11 of buffer A) was getting corrupted after buffer B was allocated, causing terrain generation to return wrong block types.
+
+**workaround**: pre-allocate ALL large buffers at startup before any gameplay begins. pass them as function parameters instead of allocating inside functions. for values that must survive heap corruption (like world seed), store them in i32 stack variables instead of in heap buffers, since stack variables are immune to this corruption.
+
+## 12. str_to_i32 doesnt handle overflow gracefully
+
+**STATUS: OPEN** - when parsing a string like `"1771329710651061000"` which is way larger than INT32_MAX (2147483647), `str_to_i32` silently clamps or wraps to some value instead of returning an error. this means world seeds larger than ~2.1 billion all map to the same internal value, reducing the effective seed space.
+
+**workaround**: document that world seeds should be kept within i32 range (-2147483648 to 2147483647). alternatively could hash the string to produce a valid i32 seed.

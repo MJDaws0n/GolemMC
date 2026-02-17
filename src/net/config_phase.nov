@@ -19,6 +19,7 @@ import ../../lib/file_io;
 import ../logger;
 import packet;
 import writer;
+import embedded_registries;
 
 // ---------------------------------------------------------------------------
 // send a binary file as raw bytes to a socket
@@ -101,6 +102,12 @@ fn send_all_registries(fd: i32) -> bool {
     // zombie_nautilus_variant, timeline
     // we skip enchantment cos the client cant parse those entries from core pack
     let ok: bool = true;
+
+    // quick sanity check - if the first file doesnt exist, none of em will
+    if (!file_exists("data/reg_dimension_type.bin")) {
+        log_error("cant find data/reg_dimension_type.bin - are you running from the GolemMC directory?");
+        return false;
+    }
 
     if (!send_registry_from_file(fd, "data/reg_dimension_type.bin")) {
         ok = false;
@@ -264,10 +271,10 @@ fn wait_finish_config_ack(fd: i32) -> bool {
     let pkt_len: i32 = unpack_varint_value(pkt_packed);
     if (pkt_len <= 0) { return false; }
 
-    // read the packet data
+    // read the packet data (MUST be exact - TCP can split packets)
     let buf: str = net_make_buf(pkt_len + 1);
-    let nr: i32 = net_read(fd, buf, pkt_len);
-    if (nr <= 0) { return false; }
+    let ok: bool = read_exact(fd, buf, pkt_len);
+    if (!ok) { return false; }
 
     // parse packet id
     let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
@@ -293,15 +300,10 @@ fn eat_config_packet(fd: i32) -> i32 {
     let pkt_len: i32 = unpack_varint_value(pkt_packed);
     if (pkt_len <= 0) { return -1; }
 
-    // read and discard the payload
+    // read the payload (MUST be exact - otherwise packet_id decode is random)
     let buf: str = net_make_buf(pkt_len + 1);
-    let total_read: i32 = 0;
-    while (total_read < pkt_len) {
-        let remaining: i32 = pkt_len - total_read;
-        let nr: i32 = net_read(fd, buf, remaining);
-        if (nr <= 0) { return -1; }
-        total_read = total_read + nr;
-    }
+    let ok: bool = read_exact(fd, buf, pkt_len);
+    if (!ok) { return -1; }
 
     // parse packet id
     let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
@@ -320,13 +322,8 @@ fn eat_config_packet_fast(fd: i32) -> i32 {
     if (pkt_len <= 0) { return -1; }
 
     let buf: str = net_make_buf(pkt_len + 1);
-    let total_read: i32 = 0;
-    while (total_read < pkt_len) {
-        let remaining: i32 = pkt_len - total_read;
-        let nr: i32 = net_read(fd, buf, remaining);
-        if (nr <= 0) { return -1; }
-        total_read = total_read + nr;
-    }
+    let ok: bool = read_exact(fd, buf, pkt_len);
+    if (!ok) { return -1; }
 
     let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
     return unpack_varint_value(id_packed);
@@ -379,8 +376,8 @@ fn handle_config_phase(fd: i32) -> bool {
         }
     }
 
-    // step 3: send all registry data
-    let ok: bool = send_all_registries(fd);
+    // step 3: send all registry data (embedded in the binary, no external files needed)
+    let ok: bool = send_all_registries_embedded(fd);
     if (!ok) {
         log_debug("config: failed to send registries");
         return false;
@@ -388,7 +385,7 @@ fn handle_config_phase(fd: i32) -> bool {
     log_debug("config: sent all registries");
 
     // step 4: send Update Tags (required for timeline tags etc)
-    send_update_tags(fd);
+    send_update_tags_embedded(fd);
     log_debug("config: sent update tags");
 
     // step 5: send finish configuration

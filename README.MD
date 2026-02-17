@@ -16,21 +16,22 @@ A Minecraft server. Not written in Java. Written in [Novus](https://github.com/M
 | configuration phase | ✅ done | sends registry data (dimensions, biomes, chat types etc) |
 | play state - join world | ✅ done | login play, spawn position, player position |
 | flat world chunk generation | ✅ done | stone + grass flat world, 7x7 chunk grid |
+| terrain generation (perlin noise) | ✅ done | hills, caves, ores, bedrock, proper block layers |
 | keep alive packets | ✅ done | keeps connection alive every ~20s |
 | SIGPIPE handling | ✅ done | server doesnt crash when players disconnect |
 | player join/leave messages | ✅ done | console + future chat output |
 | multi-player support | ❌ todo | currently single player only |
 | player movement sync | ❌ todo | broadcasting position to other players |
 | chat system | ❌ todo | player-to-player messaging |
-| block breaking | ❌ todo | digging packets + block updates |
-| block placing | ❌ todo | placement packets + block updates |
+| block breaking | ✅ done | creative instant-break + survival digging |
+| block placing | ✅ done | click-to-place (always stone for now, no inventory) |
 | PvP (hitting players) | ❌ todo | damage + knockback |
 | item drops | ❌ todo | entities when blocks break |
 | item pickup | ❌ todo | walking over dropped items |
 | inventory management | ❌ todo | proper slot tracking |
-| world persistence | ❌ todo | save/load chunks to disk |
+| world persistence | ✅ done | block changes saved to world/region/blocks.dat |
 | player data persistence | ❌ todo | save position, inventory, health |
-| terrain generation | ❌ todo | actual terrain instead of flat world |
+| terrain generation | ✅ done | perlin noise terrain with hills, caves, ores |
 | mob spawning | ❌ todo | passive + hostile mobs |
 | day/night cycle | ❌ todo | time packets |
 | weather | ❌ todo | rain and thunder |
@@ -71,6 +72,9 @@ main.nov              - entry point, CLI args, main server loop
 src/
   config.nov          - server.properties loading/generation
   world.nov           - world folder & seed file generation
+  chunk.nov           - chunk storage, block modifications, save/load
+  world/
+    terrain.nov       - perlin noise terrain generation (hills, caves, ores)
   logger.nov          - timestamped logging (info/warn/error/debug)
   console.nov         - non-blocking console input for commands
   net/
@@ -79,10 +83,9 @@ src/
     protocol.nov      - MC protocol handler (handshake → SLP or login → config → play)
     login.nov         - login sequence (login start, success, acknowledged)
     config_phase.nov  - configuration phase (registry data, known packs, finish config)
-    play.nov          - play state (join game, chunks, position, keepalive)
+    play.nov          - play state (join game, chunks, position, keepalive, block break/place)
     writer.nov        - binary data writing helpers (integers, floats, strings, positions, UUIDs)
-data/
-  reg_*.bin           - pre-built MC 1.21.4 registry data (dimension types, biomes, etc)
+    embedded_registries.nov - all 19 MC 1.21.11 registries as byte arrays
 lib/
   net.nov             - low-level networking syscalls + SIGPIPE handling
   standard_lib.nov    - core string/number utilities
@@ -97,6 +100,7 @@ lib/
 Once the server is running you can type these into the console:
 - `help` - show available commands
 - `stop` - stop the server
+- `save` - save world data to disk
 - `status` - show server status (port, motd, players)
 - `seed` - show the world seed
 - `version` - show server version
@@ -119,4 +123,4 @@ The `server.properties` file gets auto-generated on first run. You can edit it t
 
 - macOS on Apple Silicon (M1/M2/M3/M4)
 - The [Novus compiler](https://github.com/mjdaws0n/novus) (included as `novus` binary)
-- Minecraft Java Edition 1.21.4 (to actually connect)
+- Minecraft Java Edition 1.21.11 (to actually connect)

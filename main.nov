@@ -30,6 +30,8 @@ import src/net/protocol;
 import src/net/login;
 import src/net/config_phase;
 import src/net/play;
+import src/net/embedded_registries;
+import src/chunk;
 
 // ---------------------------------------------------------------------------
 // version info - in a function cos globals in main module dont work in funcs
@@ -112,6 +114,19 @@ fn main(argc: i32, argv: u64) -> i32 {
     // load or generate world
     world_init();
 
+    // initialise chunk storage (loads saved block changes from disk)
+    let chunk_state: str = chunk_alloc();
+    // store the world seed in chunk state so terrain gen can use it
+    let seed_num: i32 = str_to_i32(seed);
+    cs_set_seed(chunk_state, seed_num);
+    chunk_init(chunk_state);
+
+    // pre-allocate work buffer for chunk building + packet reading
+    // this avoids net_make_buf calls during play that corrupt chunk_state
+    // layout: [0..131071] section_buf, [131072..139263] block_cache, [139264..139775] palette
+    // [140000..141023] packet read buffer
+    let work_buf: str = net_make_buf(141024);
+
     // start the TCP server
     log_info("starting minecraft server on port " + i32_to_str(port) + "...");
 
@@ -136,6 +151,7 @@ fn main(argc: i32, argv: u64) -> i32 {
     let player_name: str = "";
     let keep_alive_counter: i32 = 0;
     let tick_counter: i32 = 0;
+    let save_counter: i32 = 0;
 
     // --------------- MAIN SERVER LOOP ---------------
     let running: bool = true;
@@ -164,22 +180,38 @@ fn main(argc: i32, argv: u64) -> i32 {
                 } else {
                     log_banner("no players online");
                 }
+            } else if (cmd == "save") {
+                chunk_save(chunk_state);
             } else {
                 running = console_handle(cmd);
             }
         }
 
         // if we have a connected player, handle their packets
+        // drain ALL pending packets from the client before checking for new connections
+        // otherwise we never get to the accept() and the server seems unresponsive
         if (player_fd >= 0) {
-            let still_alive: bool = handle_play_packet(player_fd);
-            if (!still_alive) {
-                log_info(player_name + " left the game");
-                net_close(player_fd);
-                player_fd = -1;
-                player_name = "";
-                keep_alive_counter = 0;
-            } else {
-                // send keep alive every ~20 seconds (200 ticks at 100ms each)
+            let drain: bool = true;
+            while (drain) {
+                let still_alive: bool = handle_play_packet(player_fd, chunk_state, seed_num);
+                if (!still_alive) {
+                    log_info(player_name + " left the game");
+                    net_close(player_fd);
+                    player_fd = -1;
+                    player_name = "";
+                    keep_alive_counter = 0;
+                    drain = false;
+                } else {
+                    // check if theres more data waiting right now (0ms timeout)
+                    let more: i32 = net_poll_read(player_fd, 0);
+                    if (more <= 0) {
+                        drain = false;
+                    }
+                }
+            }
+
+            // send keep alive every ~20 seconds (200 ticks at 100ms each)
+            if (player_fd >= 0) {
                 tick_counter = tick_counter + 1;
                 if (tick_counter >= 200) {
                     tick_counter = 0;
@@ -192,25 +224,29 @@ fn main(argc: i32, argv: u64) -> i32 {
 
         // check for new TCP connections (poll with 100ms timeout)
         let client_fd: i32 = tcp_accept_poll(server_fd, 100);
+
+        // auto-save every 60 seconds (600 ticks at 100ms each)
+        save_counter = save_counter + 1;
+        if (save_counter >= 600) {
+            save_counter = 0;
+            if (chunk_is_dirty(chunk_state)) {
+                chunk_save(chunk_state);
+            }
+        }
         if (client_fd >= 0) {
             log_debug("new connection accepted, fd=" + i32_to_str(client_fd));
 
             // handle_client returns username if player joined, "" for SLP
-            let username: str = handle_client(client_fd);
+            // if we already have a player connected, we still allow SLP but reject new logins
+            let username: str = handle_client(client_fd, player_fd < 0, chunk_state, work_buf);
 
             if (len(username) > 0) {
                 // a player joined! track them
-                if (player_fd >= 0) {
-                    // already have a player, kick the new one
-                    // (single player for now)
-                    log_warn("rejecting " + username + " - server full (single player mode)");
-                    net_close(client_fd);
-                } else {
-                    player_fd = client_fd;
-                    player_name = username;
-                    tick_counter = 0;
-                    keep_alive_counter = 0;
-                }
+                // (handle_client already rejects logins when player_fd is taken)
+                player_fd = client_fd;
+                player_name = username;
+                tick_counter = 0;
+                keep_alive_counter = 0;
             } else {
                 log_debug("connection handled (SLP or failed login)");
             }
@@ -219,6 +255,11 @@ fn main(argc: i32, argv: u64) -> i32 {
 
     // cleanup
     log_info("shutting down...");
+
+    // save world data before exiting
+    if (chunk_is_dirty(chunk_state)) {
+        chunk_save(chunk_state);
+    }
 
     if (player_fd >= 0) {
         net_close(player_fd);

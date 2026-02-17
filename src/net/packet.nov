@@ -193,3 +193,28 @@ fn read_varint_from_fd(fd: i32) -> i32 {
 
     return result * 16 + bytes;
 }
+
+// ---------------------------------------------------------------------------
+// read EXACTLY N bytes from a socket
+// net_read() can return partial data, so we loop until we have it all
+// returns false if the connection dies
+// ---------------------------------------------------------------------------
+
+fn read_exact(fd: i32, out: str, length: i32) -> bool {
+    let total: i32 = 0;
+    while (total < length) {
+        let remaining: i32 = length - total;
+        let tmp: str = net_make_buf(remaining + 1);
+        let nr: i32 = net_read(fd, tmp, remaining);
+        if (nr <= 0) {
+            return false;
+        }
+        let k: i32 = 0;
+        while (k < nr) {
+            out[total + k] = tmp[k];
+            k = k + 1;
+        }
+        total = total + nr;
+    }
+    return true;
+}

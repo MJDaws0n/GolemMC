@@ -76,6 +76,7 @@ fn console_handle(cmd: str) -> bool {
         print("--- GolemMC Commands ---");
         print("  help    - show this message");
         print("  stop    - stop the server");
+        print("  save    - save world data to disk");
         print("  status  - show server status");
         print("  list    - show online players");
         print("  seed    - show world seed");

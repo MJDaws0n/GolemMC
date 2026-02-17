@@ -131,6 +131,10 @@ fn net_accept(fd: i32) -> i32 {
 
 // ---------------------------------------------------------------------------
 // read from a socket into a buffer string, returns bytes read
+// IMPORTANT: on macOS ARM64, raw syscall read() returns errno (positive)
+// on error, not -1. we cant distinguish "read 9 bytes" from "EBADF=9".
+// so we check bytes available with poll first to be safe.
+// returns -1 if the socket is dead, 0 on EOF, positive on success
 // ---------------------------------------------------------------------------
 
 fn net_read(fd: i32, buf: str, max_len: i32) -> i32 {
@@ -140,6 +144,49 @@ fn net_read(fd: i32, buf: str, max_len: i32) -> i32 {
     mov(x16, 0x2000003);  // SYS_read = 3
     syscall();
     return u64_to_i32(getreg(x0));
+}
+
+// ---------------------------------------------------------------------------
+// safe read: checks socket is alive first with poll, then reads
+// returns -1 if dead, 0 on EOF, positive on success
+// ---------------------------------------------------------------------------
+
+fn net_read_safe(fd: i32, buf: str, max_len: i32) -> i32 {
+    // first check if there's actually data waiting (not just an error)
+    let avail: i32 = net_bytes_available(fd);
+    if (avail <= 0) {
+        // either error or no bytes - check if socket is alive with poll(0ms)
+        let alive: i32 = net_poll_read(fd, 0);
+        if (alive < 0) {
+            return -1;  // socket is dead (POLLHUP/POLLERR)
+        }
+        if (alive == 0) {
+            return 0;  // no data, but socket is alive (EOF or just empty)
+        }
+        // poll says readable but FIONREAD says 0 -> EOF (graceful close)
+        return -1;
+    }
+
+    // we know there are 'avail' bytes waiting, safe to read
+    let to_read: i32 = max_len;
+    if (to_read > avail) {
+        to_read = avail;
+    }
+
+    mov(x0, fd);
+    mov(x1, buf);
+    mov(x2, to_read);
+    mov(x16, 0x2000003);  // SYS_read = 3
+    syscall();
+    let nr: i32 = u64_to_i32(getreg(x0));
+
+    // if the returned value is suspicious (equals a common errno), 
+    // verify with FIONREAD that we actually consumed data
+    if (nr > 0 && nr <= to_read) {
+        return nr;
+    }
+
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +251,8 @@ fn net_poll_read(fd: i32, timeout_ms: i32) -> i32 {
     pfd[2] = to_u8_net((fd / 65536) % 256);
     pfd[3] = to_u8_net((fd / 16777216) % 256);
 
-    // events = POLLIN = 0x0001 (2 bytes little-endian)
+    // events = POLLIN (0x01) - we only ask for readability
+    // POLLHUP/POLLERR are always reported in revents regardless
     pfd[4] = to_u8_net(1);
     pfd[5] = to_u8_net(0);
 
@@ -216,7 +264,45 @@ fn net_poll_read(fd: i32, timeout_ms: i32) -> i32 {
     mov(x2, timeout_ms);
     mov(x16, 0x2000000 + 230);
     syscall();
-    return u64_to_i32(getreg(x0));
+    let ret: i32 = u64_to_i32(getreg(x0));
+
+    if (ret <= 0) { return ret; }
+
+    // check revents (bytes 6-7) for POLLHUP (16) or POLLERR (8) or POLLNVAL (32)
+    let revents: i32 = (pfd[6] & 255) + ((pfd[7] & 255) * 256);
+    // if ONLY error/hangup bits are set (no POLLIN), return -1 to signal disconnect
+    if ((revents & 1) == 0) {
+        // no POLLIN, just POLLHUP/POLLERR/POLLNVAL -> socket is dead
+        return -1;
+    }
+
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// check if a socket is still connected using ioctl FIONREAD
+// returns the number of bytes available to read, or -1 if the socket is dead
+// ---------------------------------------------------------------------------
+
+fn net_bytes_available(fd: i32) -> i32 {
+    // on macOS, FIONREAD = 0x4004667F
+    // ioctl(fd, FIONREAD, &count)
+    let count_buf: str = "\0\0\0\0";
+    let count_ptr: u64 = ptr(count_buf);
+
+    // SYS_ioctl = 54
+    mov(x0, fd);
+    mov(x1, 1074030207);  // FIONREAD = 0x4004667F
+    mov(x2, count_ptr);
+    mov(x16, 0x2000000 + 54);
+    syscall();
+
+    // read the 4-byte count (little-endian)
+    let b0: i32 = count_buf[0] & 255;
+    let b1: i32 = count_buf[1] & 255;
+    let b2: i32 = count_buf[2] & 255;
+    let b3: i32 = count_buf[3] & 255;
+    return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216);
 }
 
 // ---------------------------------------------------------------------------

@@ -41,17 +41,40 @@ fn BLOCK_SNOW_BLOCK() -> i32 { return 6727; }
 fn SEA_LEVEL() -> i32 { return 62; }
 
 // ---------------------------------------------------------------------------
+// trunc32 - forces a value into proper signed 32-bit range
+//
+// novus i32 is actually 64-bit on ARM64 so multiplications can overflow
+// past 32 bits without wrapping. this extracts the lower 32 bits and
+// sign-extends so arithmetic right shifts work correctly after
+// ---------------------------------------------------------------------------
+
+fn trunc32(val: i32) -> i32 {
+    let lo: i32 = val & 65535;
+    let hi: i32 = (val >> 16) & 65535;
+    let result: i32 = (hi << 16) | lo;
+    // sign extend - if bit 31 set (hi >= 32768) then value is negative
+    if (hi >= 32768) {
+        result = result - 2147483647 - 2147483647 - 2;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // hash function for deterministic pseudo-random numbers
 // takes x, z coords and a seed component, returns a pseudo-random i32
 // using a simple but effective hash (similar to minecraft's approach)
+//
+// trunc32 after every multiply is REQUIRED cos novus i32 doesnt wrap
+// at 32 bits - without it the noise goes absolutely mental at chunk
+// boundaries and the terrain looks like a broken mess
 // ---------------------------------------------------------------------------
 
 fn terrain_hash(x: i32, z: i32, seed: i32) -> i32 {
     let h: i32 = seed;
-    h = h + x * 374761393;
-    h = h + z * 668265263;
-    h = (h ^ (h >> 13)) * 1274126177;
-    h = h ^ (h >> 16);
+    h = trunc32(h + trunc32(x * 374761393));
+    h = trunc32(h + trunc32(z * 668265263));
+    h = trunc32(trunc32(h ^ (h >> 13)) * 1274126177);
+    h = trunc32(h ^ (h >> 16));
     // make sure its positive
     if (h < 0) { h = 0 - h; }
     return h;
@@ -59,11 +82,11 @@ fn terrain_hash(x: i32, z: i32, seed: i32) -> i32 {
 
 fn terrain_hash3(x: i32, y: i32, z: i32, seed: i32) -> i32 {
     let h: i32 = seed;
-    h = h + x * 374761393;
-    h = h + y * 1150530699;
-    h = h + z * 668265263;
-    h = (h ^ (h >> 13)) * 1274126177;
-    h = h ^ (h >> 16);
+    h = trunc32(h + trunc32(x * 374761393));
+    h = trunc32(h + trunc32(y * 1150530699));
+    h = trunc32(h + trunc32(z * 668265263));
+    h = trunc32(trunc32(h ^ (h >> 13)) * 1274126177);
+    h = trunc32(h ^ (h >> 16));
     if (h < 0) { h = 0 - h; }
     return h;
 }
@@ -74,17 +97,15 @@ fn terrain_hash3(x: i32, y: i32, z: i32, seed: i32) -> i32 {
 // 256 = 1.0, 128 = 0.5, -256 = -1.0
 // ---------------------------------------------------------------------------
 
-// gradient vectors for 2D perlin noise (pre-scaled by 256)
-// using 8 gradient directions
+// gradient vectors for 2D perlin noise
+// using 4 axis-aligned directions so we don't get diagonal magnitude issues
+// each gradient is a unit vector: (1,0), (-1,0), (0,1), (0,-1)
+// the dot product with (dx,dz) gives just dx, -dx, dz, or -dz
 fn grad2d(hash: i32, dx: i32, dz: i32) -> i32 {
-    let h: i32 = hash & 7;
-    if (h == 0) { return dx + dz; }
-    if (h == 1) { return dx; }
-    if (h == 2) { return dx - dz; }
-    if (h == 3) { return dz; }
-    if (h == 4) { return 0 - dx + dz; }
-    if (h == 5) { return 0 - dx; }
-    if (h == 6) { return 0 - dx - dz; }
+    let h: i32 = hash & 3;
+    if (h == 0) { return dx; }
+    if (h == 1) { return 0 - dx; }
+    if (h == 2) { return dz; }
     return 0 - dz;
 }
 
@@ -111,11 +132,11 @@ fn lerp(a: i32, b: i32, t: i32) -> i32 {
 // x, z are in fixed-point (scaled by 256)
 // returns value in roughly [-256, 256] range (representing [-1.0, 1.0])
 fn noise2d(x_fp: i32, z_fp: i32, seed: i32) -> i32 {
-    // get integer grid coordinates
+    // get integer grid coordinates (floor division by 256)
+    // novus >> is arithmetic shift so it already floors for negatives
+    // no extra correction needed (that was causing xf > 255 = broken noise)
     let xi: i32 = x_fp >> 8;
     let zi: i32 = z_fp >> 8;
-    if (x_fp < 0 && (x_fp & 255) != 0) { xi = xi - 1; }
-    if (z_fp < 0 && (z_fp & 255) != 0) { zi = zi - 1; }
 
     // fractional parts (0-255)
     let xf: i32 = x_fp - (xi * 256);
@@ -137,9 +158,9 @@ fn noise2d(x_fp: i32, z_fp: i32, seed: i32) -> i32 {
     let u: i32 = fade(xf);
     let v: i32 = fade(zf);
 
-    let x1: i32 = lerp(g00, g10, u);
-    let x2: i32 = lerp(g01, g11, u);
-    return lerp(x1, x2, v);
+    let lp1: i32 = lerp(g00, g10, u);
+    let lp2: i32 = lerp(g01, g11, u);
+    return lerp(lp1, lp2, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,16 +170,42 @@ fn noise2d(x_fp: i32, z_fp: i32, seed: i32) -> i32 {
 
 fn octave_noise2d(x: i32, z: i32, seed: i32, octaves: i32) -> i32 {
     let total: i32 = 0;
-    let amplitude: i32 = 256;   // starts at 1.0
+    let amplitude: i32 = 256;   // starts at 1.0 in fixed-point
     let frequency: i32 = 1;
     let max_val: i32 = 0;
 
+    // per-octave offsets so grid points don't all line up at once
+    // (without these you get ugly terrain jumps every 8/16/32/64 blocks)
+    // using prime-ish values to avoid any alignment
+    let ox0: i32 = 5347;
+    let ox1: i32 = 1731;
+    let ox2: i32 = 5903;
+    let ox3: i32 = 10337;
+    let ox4: i32 = 17291;
+    let ox5: i32 = 24571;
+    let oz0: i32 = 2917;
+    let oz1: i32 = 3557;
+    let oz2: i32 = 7919;
+    let oz3: i32 = 13177;
+    let oz4: i32 = 19433;
+    let oz5: i32 = 28657;
+
     let i: i32 = 0;
     while (i < octaves) {
-        // scale coords by frequency
-        // we divide by a base scale to get nice terrain-sized features
-        let nx: i32 = (x * frequency * 256) / 64;  // /64 = each noise cell is ~64 blocks
-        let nz: i32 = (z * frequency * 256) / 64;
+        // pick offset for this octave
+        let off_x: i32 = 0;
+        let off_z: i32 = 0;
+        if (i == 0) { off_x = ox0; off_z = oz0; }
+        if (i == 1) { off_x = ox1; off_z = oz1; }
+        if (i == 2) { off_x = ox2; off_z = oz2; }
+        if (i == 3) { off_x = ox3; off_z = oz3; }
+        if (i == 4) { off_x = ox4; off_z = oz4; }
+        if (i == 5) { off_x = ox5; off_z = oz5; }
+
+        // scale coords by frequency, offset to break grid alignment
+        // /128 = each noise cell is ~128 blocks at octave 0 (bigger = smoother terrain)
+        let nx: i32 = ((x + off_x) * frequency * 256) / 128;
+        let nz: i32 = ((z + off_z) * frequency * 256) / 128;
 
         let n: i32 = noise2d(nx, nz, seed + i * 31337);
         total = total + (n * amplitude) / 256;
@@ -177,11 +224,11 @@ fn octave_noise2d(x: i32, z: i32, seed: i32, octaves: i32) -> i32 {
 }
 
 // 3D noise for caves (simpler, less octaves)
+// offsets break grid alignment just like octave_noise2d
 fn noise3d_simple(x: i32, y: i32, z: i32, seed: i32) -> i32 {
-    // use 2D noise on different planes and combine
-    let n1: i32 = noise2d((x * 256) / 16, (z * 256) / 16, seed);
-    let n2: i32 = noise2d((x * 256) / 16, (y * 256) / 16, seed + 12345);
-    let n3: i32 = noise2d((y * 256) / 16, (z * 256) / 16, seed + 67890);
+    let n1: i32 = noise2d(((x + 173) * 256) / 16, ((z + 491) * 256) / 16, seed);
+    let n2: i32 = noise2d(((x + 337) * 256) / 16, ((y + 619) * 256) / 16, seed + 12345);
+    let n3: i32 = noise2d(((y + 251) * 256) / 16, ((z + 773) * 256) / 16, seed + 67890);
     return (n1 + n2 + n3) / 3;
 }
 
@@ -201,9 +248,12 @@ fn terrain_height(x: i32, z: i32, seed: i32) -> i32 {
     // peaks/valleys - small scale bumps
     let peaks: i32 = octave_noise2d(x, z, seed + 77777, 2);
 
-    // combine: base height 64, continental gives +-30, erosion +-10, peaks +-5
-    // continental ranges [-256, 256], so * 30 / 256 = +-30
-    let height: i32 = 64 + (continental * 30) / 256 + (erosion * 10) / 256 + (peaks * 5) / 256;
+    // combine: base height 64
+    // noise actual range is about [-100, 100] so we scale accordingly
+    // continental = big hills/valleys (+-25 blocks)
+    // erosion = medium bumps (+-8 blocks)  
+    // peaks = small detail (+-4 blocks)
+    let height: i32 = 64 + (continental * 64) / 256 + (erosion * 20) / 256 + (peaks * 10) / 256;
 
     // clamp to valid range
     if (height < -60) { height = -60; }

@@ -69,3 +69,25 @@ specifically: if you allocate a 262KB buffer A at startup, then later during gam
 **STATUS: OPEN** - when parsing a string like `"1771329710651061000"` which is way larger than INT32_MAX (2147483647), `str_to_i32` silently clamps or wraps to some value instead of returning an error. this means world seeds larger than ~2.1 billion all map to the same internal value, reducing the effective seed space.
 
 **workaround**: document that world seeds should be kept within i32 range (-2147483648 to 2147483647). alternatively could hash the string to produce a valid i32 seed.
+
+## 13. i32 arithmetic doesnt truncate to 32 bits
+
+**STATUS: OPEN** - novus compiles i32 variables to 64-bit ARM64 registers (x0-x28). when you multiply two i32 values that would overflow 32 bits (like `x * 374761393`), the result is a full 64-bit value - it doesnt wrap/truncate at 32 bits like a real int32 would. this means hash functions and any math relying on 32-bit overflow wrapping produce completely wrong results.
+
+for example: `terrain_hash(0, 0, 12345)` returned `15727716263813` (a 44-bit number) instead of the expected 32-bit result. right-shifting this 64-bit value by 13 or 16 bits operates on the wrong bit range, producing garbage.
+
+**workaround**: manually truncate to 32 bits after every multiply that could overflow. we wrote a `trunc32()` function that extracts the lower 32 bits: `lo = val & 65535; hi = (val >> 16) & 65535; result = (hi << 16) | lo`. for sign extension when the result should be negative: `if (hi >= 32768) { result = result - 2147483647 - 2147483647 - 2; }`.
+
+**expected behaviour**: i32 operations should automatically mask results to 32 bits, or the compiler should use w-registers (w0-w28) instead of x-registers for i32 values.
+
+## 14. variable names collide with ARM64 register names
+
+**STATUS: OPEN** - if you name a local variable `x1`, `x2`, etc (matching ARM64 register names x0-x30), the compiler silently uses the actual hardware register instead of allocating stack/register storage properly. this means the variable shares storage with whatever the compiler is using that register for, causing completely wrong computation results with no error message.
+
+the compiler DOES reject `x1`/`x2` as variable names in the main module (gives "cannot declare variable with reserved name" error), but it SILENTLY ACCEPTS them inside functions in imported modules. the function compiles and runs but produces garbage results because reads/writes go to the raw register instead of proper variable storage.
+
+we had `let x1: i32 = lerp(g00, g10, u);` inside `noise2d()` in an imported module. it compiled fine but `noise2d` returned wildly wrong values. renaming to `lp1` fixed it instantly.
+
+**workaround**: never use register names (x0-x30, w0-w30, sp, lr, fp, etc) as variable names anywhere. if the compiler doesnt give you an error, that doesnt mean its safe - it might silently use the register.
+
+**expected behaviour**: the compiler should ALWAYS reject reserved register names as variable names, in ALL modules and ALL scopes, with a clear error message.

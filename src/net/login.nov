@@ -1,0 +1,85 @@
+// ---------------------------------------------------------------------------
+// login.nov - handles the MC login sequence
+//
+// when a player wants to join, the client sends login start with their
+// username, we send back login success with a UUID, then they acknowledge
+// and we move into the configuration phase
+//
+// we only support offline mode rn (no mojang auth or encryption)
+// ---------------------------------------------------------------------------
+
+module login;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+import ../../lib/memory;
+import packet;
+import writer;
+
+// ---------------------------------------------------------------------------
+// parse the login start packet and extract the username
+// login start (0x00): MC string (username)
+// ---------------------------------------------------------------------------
+
+fn parse_login_start(buf: str, id_size: i32, pkt_len: i32) -> str {
+    return read_mc_string(buf, id_size, pkt_len);
+}
+
+// ---------------------------------------------------------------------------
+// send login success packet (0x02)
+// contains: UUID (16 bytes) + username (MC string) + num properties (VarInt 0)
+// ---------------------------------------------------------------------------
+
+fn send_login_success(fd: i32, username: str) -> void {
+    // we need to build this packet with known size
+    // UUID = 16 bytes
+    // username string = varint(len) + bytes
+    // number of properties = varint(0)
+
+    let uname_len: i32 = len(username);
+    let uname_vi: i32 = varint_size(uname_len);
+    let payload_len: i32 = 16 + uname_vi + uname_len + 1;
+    // 16 (uuid) + varint(username_len) + username + varint(0) for properties
+
+    let id_len: i32 = varint_size(2);  // packet id 0x02
+    let total: i32 = id_len + payload_len;
+
+    // write packet length
+    write_varint_to_fd(fd, total);
+    // write packet id
+    write_varint_to_fd(fd, 2);
+    // write UUID
+    write_uuid_offline(fd, username);
+    // write username
+    write_mc_string(fd, username);
+    // write number of properties (0)
+    write_varint_to_fd(fd, 0);
+}
+
+// ---------------------------------------------------------------------------
+// wait for login acknowledged (0x03) from client
+// returns true if received ok
+// ---------------------------------------------------------------------------
+
+fn wait_login_acknowledged(fd: i32) -> bool {
+    let ready: i32 = net_poll_read(fd, 10000);
+    if (ready <= 0) { return false; }
+
+    let pkt_packed: i32 = read_varint_from_fd(fd);
+    if (pkt_packed < 0) { return false; }
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0) { return false; }
+
+    // read the packet data
+    let buf: str = net_make_buf(pkt_len + 1);
+    let nr: i32 = net_read(fd, buf, pkt_len);
+    if (nr <= 0) { return false; }
+
+    // parse packet id
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    let packet_id: i32 = unpack_varint_value(id_packed);
+
+    // login acknowledged is packet 0x03
+    return packet_id == 3;
+}

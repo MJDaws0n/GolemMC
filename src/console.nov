@@ -1,0 +1,91 @@
+// ---------------------------------------------------------------------------
+// console.nov - non-blocking console input system
+// this is how we get that minecraft-style console where u can type commands
+// while the server is still doing its thing
+// uses poll() to check stdin without blocking the main loop
+// ---------------------------------------------------------------------------
+
+module console;
+
+import ../lib/standard_lib;
+import ../lib/standard_lib_macos_silicon;
+import ../lib/memory;
+import ../lib/net;
+
+// ---------------------------------------------------------------------------
+// check if theres any input waiting on stdin (fd 0)
+// uses poll with 0 timeout so it returns immediately
+// ---------------------------------------------------------------------------
+
+fn console_has_input() -> bool {
+    let ready: i32 = net_poll_read(0, 0);
+    return ready > 0;
+}
+
+// ---------------------------------------------------------------------------
+// try to read a complete line from stdin
+// returns the line if data is available, empty string otherwise
+// stdin is line-buffered so we get a full line when available
+// ---------------------------------------------------------------------------
+
+fn console_try_read() -> str {
+    if (!console_has_input()) {
+        return "";
+    }
+
+    // read whatever bytes are available (line-buffered stdin gives us a line)
+    let buf: str = "";
+    let i: i32 = 0;
+    while (i < 256) {
+        buf = buf + "\0";
+        i = i + 1;
+    }
+    let nread: i32 = net_read(0, buf, 256);
+
+    if (nread <= 0) {
+        return "";
+    }
+
+    // extract the line (strip newline)
+    let line: str = "";
+    i = 0;
+    while (i < nread) {
+        if (buf[i] == '\n' || buf[i] == '\r') {
+            break;
+        }
+        line = line + buf[i];
+        i = i + 1;
+    }
+
+    return line;
+}
+
+// ---------------------------------------------------------------------------
+// handle a console command
+// returns true if the server should keep running
+// ---------------------------------------------------------------------------
+
+fn console_handle(cmd: str) -> bool {
+    if (len(cmd) == 0) {
+        return true;
+    }
+
+    if (cmd == "stop" || cmd == "quit" || cmd == "exit") {
+        return false;
+    } else if (cmd == "help" || cmd == "?") {
+        print("--- GolemMC Commands ---");
+        print("  help    - show this message");
+        print("  stop    - stop the server");
+        print("  status  - show server status");
+        print("  list    - show online players");
+        print("  seed    - show world seed");
+        print("  version - show server version");
+        print("------------------------");
+    } else if (cmd == "version" || cmd == "ver") {
+        print("GolemMC v0.2.0 by MJDawson");
+    } else {
+        print("unknown command: '" + cmd + "' (type 'help' for commands)");
+    }
+
+    return true;
+}

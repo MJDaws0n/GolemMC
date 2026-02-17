@@ -1,0 +1,269 @@
+// ---------------------------------------------------------------------------
+// protocol.nov - minecraft protocol handler
+//
+// this is the brain of the network stack - routes incoming connections
+// through the right protocol states:
+//
+// SLP (server list ping):
+//   handshake (next_state=1) -> status request -> status response -> ping/pong
+//
+// player login:
+//   handshake (next_state=2) -> login start -> login success -> login ack
+//   -> config phase (registries, known packs, finish config)
+//   -> play phase (join game, chunks, spawn, game loop)
+//
+// the handshake determines which path we take. SLP is quick and closes,
+// login starts the full gameplay pipeline
+// ---------------------------------------------------------------------------
+
+module protocol;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+import ../config;
+import ../logger;
+import packet;
+import writer;
+import login;
+import config_phase;
+import play;
+
+// ---------------------------------------------------------------------------
+// build the status response JSON
+// this is what shows up in the server list - motd, player count, version etc
+// ---------------------------------------------------------------------------
+
+fn build_status_json(online_count: i32) -> str {
+    let motd: str = config_get_motd();
+    let max_p: str = i32_to_str(config_get_max_players());
+
+    // build the JSON manually (no json lib lol)
+    let json: str = "{";
+    json = json + "\"version\":{";
+    json = json + "\"name\":\"1.21.11\",";
+    json = json + "\"protocol\":774";
+    json = json + "},";
+    json = json + "\"players\":{";
+    json = json + "\"max\":" + max_p + ",";
+    json = json + "\"online\":" + i32_to_str(online_count) + ",";
+    json = json + "\"sample\":[]";
+    json = json + "},";
+    json = json + "\"description\":{";
+    json = json + "\"text\":\"" + motd + "\"";
+    json = json + "},";
+    json = json + "\"enforcesSecureChat\":false";
+    json = json + "}";
+
+    return json;
+}
+
+// ---------------------------------------------------------------------------
+// read a single packet from a client connection
+// fills buf with packet data, returns packet length
+// sets packet_id and id_size via the packed format
+// returns -1 on error
+// ---------------------------------------------------------------------------
+
+fn read_client_packet(client_fd: i32, buf: str, max_buf: i32, timeout_ms: i32) -> i32 {
+    let ready: i32 = net_poll_read(client_fd, timeout_ms);
+    if (ready <= 0) { return -1; }
+
+    let pkt_packed: i32 = read_varint_from_fd(client_fd);
+    if (pkt_packed < 0) { return -1; }
+
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0 || pkt_len > max_buf) { return -1; }
+
+    // read the full packet payload
+    let total_read: i32 = 0;
+    while (total_read < pkt_len) {
+        let remaining: i32 = pkt_len - total_read;
+        let tmp: str = net_make_buf(remaining + 1);
+        let nr: i32 = net_read(client_fd, tmp, remaining);
+        if (nr <= 0) { return -1; }
+        let k: i32 = 0;
+        while (k < nr) {
+            buf[total_read + k] = tmp[k];
+            k = k + 1;
+        }
+        total_read = total_read + nr;
+    }
+
+    return pkt_len;
+}
+
+// ---------------------------------------------------------------------------
+// handle SLP (server list ping) - the quick status check
+// client just wants to know if were alive and what our info is
+// ---------------------------------------------------------------------------
+
+fn handle_slp(client_fd: i32) -> void {
+    let alive: bool = true;
+    let buf: str = net_make_buf(1025);
+
+    while (alive) {
+        let pkt_len: i32 = read_client_packet(client_fd, buf, 1024, 5000);
+        if (pkt_len < 0) { break; }
+
+        let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+        let packet_id: i32 = unpack_varint_value(id_packed);
+        let id_size: i32 = unpack_varint_size(id_packed);
+
+        if (packet_id == 0) {
+            // status request - send our server info
+            let json: str = build_status_json(0);
+            send_string_packet(client_fd, 0, json);
+        }
+        else if (packet_id == 1) {
+            // ping - echo back the payload as pong
+            let ping_len: i32 = pkt_len - id_size;
+            let pong_inner: i32 = 1 + ping_len;
+            write_varint_to_fd(client_fd, pong_inner);
+            write_varint_to_fd(client_fd, 1);
+            let ping_buf: str = net_make_buf(ping_len + 1);
+            let j: i32 = 0;
+            while (j < ping_len) {
+                ping_buf[j] = buf[id_size + j];
+                j = j + 1;
+            }
+            write_raw(client_fd, ping_buf, ping_len);
+            alive = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handle player login + config + play - the full join flow
+// this is where players actually get into the game
+// returns the username of the player who joined (or "" on failure)
+// ---------------------------------------------------------------------------
+
+fn handle_player_join(client_fd: i32) -> str {
+    let buf: str = net_make_buf(1025);
+
+    // step 1: read Login Start packet (0x00 in login state)
+    let pkt_len: i32 = read_client_packet(client_fd, buf, 1024, 10000);
+    if (pkt_len < 0) {
+        log_debug("login: failed to read login start packet");
+        return "";
+    }
+
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    let packet_id: i32 = unpack_varint_value(id_packed);
+    let id_size: i32 = unpack_varint_size(id_packed);
+
+    if (packet_id != 0) {
+        log_debug("login: expected packet 0x00, got " + i32_to_str(packet_id));
+        return "";
+    }
+
+    // parse the username from login start
+    let username: str = parse_login_start(buf, id_size, pkt_len);
+    if (len(username) == 0) {
+        log_debug("login: empty username");
+        return "";
+    }
+
+    log_info(username + " is logging in...");
+    let uuid_str: str = uuid_hex_from_name(username);
+    log_debug("login: uuid=" + uuid_str);
+
+    // step 2: send Login Success
+    send_login_success(client_fd, username);
+    log_debug("login: sent login success");
+
+    // step 3: wait for Login Acknowledged
+    let ack: bool = wait_login_acknowledged(client_fd);
+    if (!ack) {
+        log_warn(username + " failed to acknowledge login");
+        return "";
+    }
+    log_debug("login: received login acknowledged");
+
+    // step 4: configuration phase
+    log_debug("config: starting configuration phase");
+    let config_ok: bool = handle_config_phase(client_fd);
+    if (!config_ok) {
+        log_warn(username + " failed during configuration phase");
+        return "";
+    }
+    log_debug("config: configuration phase complete");
+
+    // step 5: play phase - send initial world data
+    log_debug("play: sending world data");
+    send_play_login(client_fd, 1);  // entity id 1 for now
+    log_info(username + " joined the game");
+
+    return username;
+}
+
+// ---------------------------------------------------------------------------
+// handle a complete client connection
+// reads the handshake to determine if its SLP or login,
+// then routes to the appropriate handler
+//
+// returns the username if a player joined, or "" for SLP/failure
+// the caller keeps the fd open if a player joined (for the game loop)
+// ---------------------------------------------------------------------------
+
+fn handle_client(client_fd: i32) -> str {
+    let buf: str = net_make_buf(1025);
+
+    // read the handshake packet
+    let pkt_len: i32 = read_client_packet(client_fd, buf, 1024, 5000);
+    if (pkt_len < 0) {
+        net_close(client_fd);
+        return "";
+    }
+
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    let packet_id: i32 = unpack_varint_value(id_packed);
+    let id_size: i32 = unpack_varint_size(id_packed);
+
+    if (packet_id != 0) {
+        // not a handshake, bail
+        net_close(client_fd);
+        return "";
+    }
+
+    // parse handshake fields
+    let pos: i32 = id_size;
+
+    // skip protocol version
+    let proto_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    pos = pos + unpack_varint_size(proto_packed);
+
+    // skip server address
+    let addr_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let addr_len: i32 = unpack_varint_value(addr_packed);
+    pos = pos + unpack_varint_size(addr_packed);
+    pos = pos + addr_len;
+
+    // skip port (2 bytes)
+    pos = pos + 2;
+
+    // read next state
+    let ns_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let next_state: i32 = unpack_varint_value(ns_packed);
+
+    if (next_state == 1) {
+        // SLP - handle status ping and close
+        log_debug("SLP: handling server list ping");
+        handle_slp(client_fd);
+        net_close(client_fd);
+        return "";
+    } else if (next_state == 2) {
+        // login - try to get the player in
+        log_debug("LOGIN: player connecting...");
+        let username: str = handle_player_join(client_fd);
+        if (len(username) == 0) {
+            net_close(client_fd);
+        }
+        // if username is set, caller keeps the fd open for game loop
+        return username;
+    }
+
+    net_close(client_fd);
+    return "";
+}

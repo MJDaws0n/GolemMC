@@ -1,0 +1,235 @@
+// ---------------------------------------------------------------------------
+// GolemMC - a minecraft server written in novus
+//
+// this is the main entry point - boots up the server, loads config,
+// generates world files, starts the TCP listener, and handles
+// everything from server list ping to actual player connections
+//
+// right now we support:
+// - showing up in the MC server list (SLP protocol)
+// - player login + configuration phase
+// - flat world chunk generation
+// - basic play state (player can join and look around)
+// ---------------------------------------------------------------------------
+
+module GolemMC;
+
+import lib/standard_lib;
+import lib/standard_lib_macos_silicon;
+import lib/memory;
+import lib/net;
+
+import src/logger;
+import src/config;
+import src/world;
+import src/console;
+import src/net/tcp;
+import src/net/packet;
+import src/net/writer;
+import src/net/protocol;
+import src/net/login;
+import src/net/config_phase;
+import src/net/play;
+
+// ---------------------------------------------------------------------------
+// version info - in a function cos globals in main module dont work in funcs
+// ---------------------------------------------------------------------------
+
+fn get_version() -> str {
+    return "0.2.0";
+}
+
+// ---------------------------------------------------------------------------
+// parse CLI args for --debug flag and other goodies
+// ---------------------------------------------------------------------------
+
+fn parse_args(argc: i32, argv: u64) -> void {
+    let i: i32 = 1;
+    while (i < argc) {
+        let arg: str = argv_get(argv, i);
+        if (arg == "--debug") {
+            logger_set_debug(true);
+        }
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// print the startup banner
+// ---------------------------------------------------------------------------
+
+fn print_banner() -> void {
+    log_banner("");
+    log_banner("   ██████╗  ██████╗ ██╗     ███████╗███╗   ███╗███╗   ███╗ ██████╗");
+    log_banner("  ██╔════╝ ██╔═══██╗██║     ██╔════╝████╗ ████║████╗ ████║██╔════╝");
+    log_banner("  ██║  ███╗██║   ██║██║     █████╗  ██╔████╔██║██╔████╔██║██║     ");
+    log_banner("  ██║   ██║██║   ██║██║     ██╔══╝  ██║╚██╔╝██║██║╚██╔╝██║██║     ");
+    log_banner("  ╚██████╔╝╚██████╔╝███████╗███████╗██║ ╚═╝ ██║██║ ╚═╝ ██║╚██████╗");
+    log_banner("   ╚═════╝  ╚═════╝ ╚══════╝╚══════╝╚═╝     ╚═╝╚═╝     ╚═╝ ╚═════╝");
+    log_banner("                                              v" + get_version());
+    log_banner("");
+}
+
+// ---------------------------------------------------------------------------
+// main - where it all begins
+// ---------------------------------------------------------------------------
+
+fn main(argc: i32, argv: u64) -> i32 {
+    // ignore SIGPIPE so disconnected clients dont crash the server
+    net_ignore_sigpipe();
+
+    // clean up any leftover debug flag from previous run
+    file_delete(".golem_debug");
+
+    // parse command line args first (may create .golem_debug)
+    parse_args(argc, argv);
+
+    // show the banner
+    print_banner();
+
+    log_info("starting GolemMC v" + get_version() + "...");
+
+    if (logger_is_debug()) {
+        log_info("debug mode enabled - prepare for extra logs lol");
+    }
+
+    // load or generate config
+    config_init();
+
+    // cache config values locally so we dont re-read the file constantly
+    let port: i32 = config_get_port();
+    let motd: str = config_get_motd();
+    let max_players: i32 = config_get_max_players();
+    let world_name: str = config_get_world_name();
+    let seed: str = config_get_seed();
+
+    log_debug("config: port=" + i32_to_str(port));
+    log_debug("config: motd=" + motd);
+    log_debug("config: max-players=" + i32_to_str(max_players));
+    log_debug("config: world=" + world_name);
+    log_debug("config: seed=" + seed);
+
+    // load or generate world
+    world_init();
+
+    // start the TCP server
+    log_info("starting minecraft server on port " + i32_to_str(port) + "...");
+
+    let server_fd: i32 = tcp_start(port);
+    if (server_fd < 0) {
+        log_error("failed to bind to port " + i32_to_str(port) + " - is another server already running?");
+        log_error("kill the other process or change the port in server.properties");
+        exit(1);
+        return 1;
+    }
+
+    log_info("server is running on *:" + i32_to_str(port));
+    log_info("type 'help' for a list of commands");
+
+    // set stdin to non-blocking for console input
+    net_set_nonblock(0);
+
+    // --------------- PLAYER STATE ---------------
+    // since we're single-threaded, we track one connected player at a time
+    // TODO: support multiple players with an fd array
+    let player_fd: i32 = -1;
+    let player_name: str = "";
+    let keep_alive_counter: i32 = 0;
+    let tick_counter: i32 = 0;
+
+    // --------------- MAIN SERVER LOOP ---------------
+    let running: bool = true;
+
+    while (running) {
+        // check for console input (non-blocking)
+        let cmd: str = console_try_read();
+        if (len(cmd) > 0) {
+            if (cmd == "status") {
+                log_banner("--- Server Status ---");
+                log_banner("  version: GolemMC v" + get_version());
+                log_banner("  port: " + i32_to_str(port));
+                log_banner("  motd: " + motd);
+                if (player_fd >= 0) {
+                    log_banner("  players: 1/" + i32_to_str(max_players) + " (" + player_name + ")");
+                } else {
+                    log_banner("  players: 0/" + i32_to_str(max_players));
+                }
+                log_banner("  world: " + world_name);
+                log_banner("---------------------");
+            } else if (cmd == "seed") {
+                log_banner("world seed: " + seed);
+            } else if (cmd == "list") {
+                if (player_fd >= 0) {
+                    log_banner("online players (1): " + player_name);
+                } else {
+                    log_banner("no players online");
+                }
+            } else {
+                running = console_handle(cmd);
+            }
+        }
+
+        // if we have a connected player, handle their packets
+        if (player_fd >= 0) {
+            let still_alive: bool = handle_play_packet(player_fd);
+            if (!still_alive) {
+                log_info(player_name + " left the game");
+                net_close(player_fd);
+                player_fd = -1;
+                player_name = "";
+                keep_alive_counter = 0;
+            } else {
+                // send keep alive every ~20 seconds (200 ticks at 100ms each)
+                tick_counter = tick_counter + 1;
+                if (tick_counter >= 200) {
+                    tick_counter = 0;
+                    keep_alive_counter = keep_alive_counter + 1;
+                    send_keep_alive(player_fd, keep_alive_counter);
+                    log_debug("sent keep alive #" + i32_to_str(keep_alive_counter));
+                }
+            }
+        }
+
+        // check for new TCP connections (poll with 100ms timeout)
+        let client_fd: i32 = tcp_accept_poll(server_fd, 100);
+        if (client_fd >= 0) {
+            log_debug("new connection accepted, fd=" + i32_to_str(client_fd));
+
+            // handle_client returns username if player joined, "" for SLP
+            let username: str = handle_client(client_fd);
+
+            if (len(username) > 0) {
+                // a player joined! track them
+                if (player_fd >= 0) {
+                    // already have a player, kick the new one
+                    // (single player for now)
+                    log_warn("rejecting " + username + " - server full (single player mode)");
+                    net_close(client_fd);
+                } else {
+                    player_fd = client_fd;
+                    player_name = username;
+                    tick_counter = 0;
+                    keep_alive_counter = 0;
+                }
+            } else {
+                log_debug("connection handled (SLP or failed login)");
+            }
+        }
+    }
+
+    // cleanup
+    log_info("shutting down...");
+
+    if (player_fd >= 0) {
+        net_close(player_fd);
+    }
+
+    tcp_stop(server_fd);
+
+    // clean up debug flag file
+    file_delete(".golem_debug");
+
+    log_info("server stopped. see ya o/");
+
+    return 0;
+}

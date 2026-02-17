@@ -1,0 +1,96 @@
+// ---------------------------------------------------------------------------
+// logger.nov - the logging system for golemmc
+// handles all the console output with timestamps and stuff like that
+// basically makes our logs look clean like real minecraft does
+// supports normal info logs + debug mode for when u need the extra details
+//
+// debug state is stored via a file flag cause novus globals across
+// modules are a bit quirky atm. we use a tiny file as a boolean flag
+// ---------------------------------------------------------------------------
+
+module logger;
+
+import ../lib/standard_lib;
+import ../lib/standard_lib_macos_silicon;
+import ../lib/file_io;
+import ../lib/memory;
+
+fn logger_set_debug(enabled: bool) -> void {
+    if (enabled) {
+        let fd: i32 = file_open_write(".golem_debug");
+        file_write_str(fd, "1");
+        file_close(fd);
+    }
+}
+
+fn logger_is_debug() -> bool {
+    return file_exists(".golem_debug");
+}
+
+// ---------------------------------------------------------------------------
+// timestamp helper
+// ---------------------------------------------------------------------------
+
+fn i64_to_i32_log(v: i64) -> i32 {
+    let r: i32 = 0;
+    if (v >= 0) {
+        while (v > 0) {
+            r = r + 1;
+            v = v - 1;
+            if (r > 86400) { return r; }
+        }
+    }
+    return r;
+}
+
+fn get_timestamp() -> str {
+    let ns: i64 = get_time_ns();
+    let secs: i64 = ns / 1000000000;
+
+    // utc time calc - hours mins secs
+    let total_secs: i64 = secs % 86400;
+    let h: i32 = i64_to_i32_log(total_secs / 3600);
+    let m: i32 = i64_to_i32_log((total_secs % 3600) / 60);
+    let s: i32 = i64_to_i32_log(total_secs % 60);
+
+    let h_str: str = i32_to_str(h);
+    let m_str: str = i32_to_str(m);
+    let s_str: str = i32_to_str(s);
+
+    if (h < 10) { h_str = "0" + h_str; }
+    if (m < 10) { m_str = "0" + m_str; }
+    if (s < 10) { s_str = "0" + s_str; }
+
+    return h_str + ":" + m_str + ":" + s_str;
+}
+
+// ---------------------------------------------------------------------------
+// core log functions
+// ---------------------------------------------------------------------------
+
+fn log_info(msg: str) -> void {
+    let ts: str = get_timestamp();
+    print("[" + ts + " INFO]: " + msg);
+}
+
+fn log_warn(msg: str) -> void {
+    let ts: str = get_timestamp();
+    print("[" + ts + " WARN]: " + msg);
+}
+
+fn log_error(msg: str) -> void {
+    let ts: str = get_timestamp();
+    print("[" + ts + " ERROR]: " + msg);
+}
+
+fn log_debug(msg: str) -> void {
+    if (logger_is_debug()) {
+        let ts: str = get_timestamp();
+        print("[" + ts + " DEBUG]: " + msg);
+    }
+}
+
+// special log for server startup banner vibes
+fn log_banner(msg: str) -> void {
+    print(msg);
+}

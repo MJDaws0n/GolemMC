@@ -1,0 +1,529 @@
+// ---------------------------------------------------------------------------
+// play.nov - handles the MC play state packets
+//
+// once a player is through login + config, they enter the play state
+// this is where we send em the world data, spawn em in, and handle
+// all the gameplay packets like movement, chat, block interaction etc
+//
+// for now we just send the minimum packets to get them spawned in
+// a flat world and able to look around. baby steps innit
+// ---------------------------------------------------------------------------
+
+module play;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+import packet;
+import writer;
+
+// ---------------------------------------------------------------------------
+// send the Login (Play) packet - 0x30
+// this is the first packet in the play state, tells the client about
+// the world theyre joining
+// ---------------------------------------------------------------------------
+
+fn send_login_play(fd: i32, entity_id: i32) -> void {
+    // Login (Play) packet fields for 1.21.11:
+    // - Entity ID: i32
+    // - Is Hardcore: bool
+    // - Dimension Count: VarInt (1)
+    // - Dimension Names: array of Identifier
+    // - Max Players: VarInt (ignored by client)
+    // - View Distance: VarInt
+    // - Simulation Distance: VarInt
+    // - Reduced Debug Info: bool
+    // - Enable Respawn Screen: bool
+    // - Do Limited Crafting: bool
+    // - Dimension Type: VarInt (registry id)
+    // - Dimension Name: Identifier
+    // - Hashed Seed: i64
+    // - Game Mode: u8
+    // - Previous Game Mode: i8 (-1 = none)
+    // - Is Debug: bool
+    // - Is Flat: bool
+    // - Has Death Location: bool
+    // - Portal Cooldown: VarInt
+    // - Sea Level: VarInt
+    // - Enforces Secure Chat: bool
+
+    // we need to calculate the total size first
+    let dim_name: str = "minecraft:overworld";
+    let dim_name_size: i32 = varint_size(len(dim_name)) + len(dim_name);
+
+    // calculate payload size
+    let payload: i32 = 0;
+    payload = payload + 4;              // entity id (i32)
+    payload = payload + 1;              // is hardcore (bool)
+    payload = payload + varint_size(1); // dimension count
+    payload = payload + dim_name_size;  // dimension name array (1 entry)
+    payload = payload + varint_size(20); // max players
+    payload = payload + varint_size(10); // view distance
+    payload = payload + varint_size(10); // simulation distance
+    payload = payload + 1;              // reduced debug info
+    payload = payload + 1;              // enable respawn screen
+    payload = payload + 1;              // do limited crafting
+    payload = payload + varint_size(0); // dimension type (registry id 0)
+    payload = payload + dim_name_size;  // dimension name
+    payload = payload + 8;              // hashed seed (i64)
+    payload = payload + 1;              // game mode
+    payload = payload + 1;              // previous game mode
+    payload = payload + 1;              // is debug
+    payload = payload + 1;              // is flat
+    payload = payload + 1;              // has death location
+    payload = payload + varint_size(0); // portal cooldown
+    payload = payload + varint_size(63); // sea level
+    payload = payload + 1;              // enforces secure chat
+
+    let pkt_id: i32 = 48;  // 0x30 Login (Play)
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    // write the packet
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+
+    write_i32(fd, entity_id);       // entity id
+    write_bool(fd, false);          // not hardcore
+    write_varint_to_fd(fd, 1);      // 1 dimension
+    write_mc_string(fd, dim_name);  // dimension name
+    write_varint_to_fd(fd, 20);     // max players (ignored)
+    write_varint_to_fd(fd, 10);     // view distance
+    write_varint_to_fd(fd, 10);     // simulation distance
+    write_bool(fd, false);          // reduced debug info
+    write_bool(fd, true);           // enable respawn screen
+    write_bool(fd, false);          // do limited crafting
+    write_varint_to_fd(fd, 0);      // dimension type (id 0 = first registered)
+    write_mc_string(fd, dim_name);  // dimension name
+    write_i64_zero(fd);             // hashed seed
+    write_byte(fd, 1);              // game mode (1 = creative)
+    write_byte(fd, 255);            // previous game mode (-1 as unsigned byte)
+    write_bool(fd, false);          // is debug world
+    write_bool(fd, true);           // is flat world
+    write_bool(fd, false);          // has death location
+    write_varint_to_fd(fd, 0);      // portal cooldown
+    write_varint_to_fd(fd, 63);     // sea level
+    write_bool(fd, false);          // enforces secure chat
+}
+
+// ---------------------------------------------------------------------------
+// send Game Event packet - 0x26
+// used to tell the client various things like start waiting for chunks
+// ---------------------------------------------------------------------------
+
+fn send_game_event(fd: i32, event: i32, value: i32) -> void {
+    // Game Event: u8 event + f32 value
+    let payload: i32 = 1 + 4;  // byte + float
+    let pkt_id: i32 = 38;  // 0x26 Game Event
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_byte(fd, event);
+    write_i32(fd, value);  // float as raw bits
+}
+
+// ---------------------------------------------------------------------------
+// send Set Default Spawn Position - 0x5F
+// tells the client where the world spawn is
+// in 1.21.11 this now includes dimension name + yaw + pitch
+// ---------------------------------------------------------------------------
+
+fn send_spawn_position(fd: i32, x: i32, y: i32, z: i32) -> void {
+    // Dimension Name (Identifier) + Position (packed i64) + Yaw (float) + Pitch (float)
+    let dim_name: str = "minecraft:overworld";
+    let dim_name_size: i32 = varint_size(len(dim_name)) + len(dim_name);
+    let payload: i32 = dim_name_size + 8 + 4 + 4;  // identifier + position + yaw + pitch
+    let pkt_id: i32 = 95;  // 0x5F Set Default Spawn Position
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_mc_string(fd, dim_name);  // dimension name
+    write_position(fd, x, y, z);
+    write_float_zero(fd);  // yaw = 0.0
+    write_float_zero(fd);  // pitch = 0.0
+}
+
+// ---------------------------------------------------------------------------
+// send Synchronize Player Position - 0x46
+// teleports the player to a specific position
+// the client wont render anything until it gets this
+// ---------------------------------------------------------------------------
+
+fn send_player_position(fd: i32, x: i32, y: i32, z: i32, teleport_id: i32) -> void {
+    // Teleport ID: VarInt
+    // X: Double
+    // Y: Double
+    // Z: Double
+    // Vel X: Double (0.0)
+    // Vel Y: Double (0.0)
+    // Vel Z: Double (0.0)
+    // Yaw: Float
+    // Pitch: Float
+    // Flags: Int (0 = all absolute)
+
+    let payload: i32 = 0;
+    payload = payload + varint_size(teleport_id);  // teleport id
+    payload = payload + 8;   // x double
+    payload = payload + 8;   // y double
+    payload = payload + 8;   // z double
+    payload = payload + 8;   // vel x
+    payload = payload + 8;   // vel y
+    payload = payload + 8;   // vel z
+    payload = payload + 4;   // yaw float
+    payload = payload + 4;   // pitch float
+    payload = payload + 4;   // flags int
+
+    let pkt_id: i32 = 70;  // 0x46
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_varint_to_fd(fd, teleport_id);
+    write_double_from_i32(fd, x);   // x
+    write_double_from_i32(fd, y);   // y (spawn on top of the flat world)
+    write_double_from_i32(fd, z);   // z
+    write_double_zero(fd);          // vel x
+    write_double_zero(fd);          // vel y
+    write_double_zero(fd);          // vel z
+    write_float_zero(fd);           // yaw
+    write_float_zero(fd);           // pitch
+    write_i32(fd, 0);               // flags (all absolute)
+}
+
+// ---------------------------------------------------------------------------
+// send Set Center Chunk - 0x5C
+// tells the client which chunk is the center for loading
+// ---------------------------------------------------------------------------
+
+fn send_center_chunk(fd: i32, chunk_x: i32, chunk_z: i32) -> void {
+    let payload: i32 = varint_size(chunk_x) + varint_size(chunk_z);
+    let pkt_id: i32 = 92;  // 0x5C Set Center Chunk
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_varint_to_fd(fd, chunk_x);
+    write_varint_to_fd(fd, chunk_z);
+}
+
+// ---------------------------------------------------------------------------
+// send a chunk data packet for a flat world
+// this is one of the most complex packets - it contains the actual
+// block data for a 16x384x16 column of blocks
+//
+// for our flat world:
+// y -64 to -5 (sections -4 to -1): stone (block state 1)
+// y -4 to -2 (top of section -1): dirt (block state 10)
+// y -1: grass_block (block state 8)
+// y 0 and above: air (block state 0)
+//
+// WAIT actually lets do the simple flat world:
+// y -64 to -1: stone
+// y 0 to 2: dirt
+// y 3: grass_block
+// y 4+: air
+//
+// nah lets keep it really simple for now - all stone below y=0,
+// grass at y=0, air above. a 1-layer grass world
+// ---------------------------------------------------------------------------
+
+fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32) -> void {
+    // Chunk Data and Update Light packet (0x2C in protocol 774)
+    //
+    // Format for 1.21.11:
+    // - Chunk X: i32
+    // - Chunk Z: i32
+    // - Heightmaps: Prefixed Array of Heightmap structs (we send 0 = empty)
+    // - Size: VarInt (length of chunk section data)
+    // - Data: byte array (chunk sections)
+    // - Block Entity Count: VarInt (0 for us)
+    // - Light data (BitSets + arrays)
+    //
+    // IMPORTANT: as of 1.21.5, single-value palette sections do NOT send
+    // a data array length varint anymore. the format is just:
+    //   block_count (i16) + bpe (u8=0) + palette_value (varint)
+    //   + bpe (u8=0) + biome_value (varint)
+    // no VarInt(0) for empty data arrays!
+
+    let air_id: i32 = 0;
+    let stone_id: i32 = 1;
+    let grass_id: i32 = 9;
+
+    // build chunk section data into a buffer
+    // single-value section = 2 (block_count) + 1 (bpe) + varint(id) + 1 (bpe) + varint(biome)
+    // = 6 bytes per section (with small varints), 24 sections = 144 bytes
+    let max_section_size: i32 = 200;
+    let section_buf: str = net_make_buf(max_section_size);
+    let pos: i32 = 0;
+
+    // 24 sections for overworld (y -64 to 319)
+    // sections 0-3 (y -64 to -1): stone
+    // section 4 (y 0 to 15): grass blocks (testing flat world)
+    // sections 5-23 (y 16 to 319): air
+    let section: i32 = 0;
+    while (section < 24) {
+        if (section < 4) {
+            // stone section - block count = 4096 = 0x1000
+            section_buf[pos] = 16;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            // block states: bpe=0, palette=stone (no data array in 1.21.5+)
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = stone_id;
+            pos = pos + 1;
+            // biomes: bpe=0, palette=0 (plains)
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+        } else if (section == 4) {
+            // grass section - block count = 4096
+            section_buf[pos] = 16;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = grass_id;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+        } else {
+            // air section - block count = 0
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = air_id;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+            section_buf[pos] = 0;
+            pos = pos + 1;
+        }
+        section = section + 1;
+    }
+
+    let chunk_data_len: i32 = pos;
+
+    // heightmaps = Prefixed Array of Heightmap structs
+    // we send 0 (empty array) - client calculates its own
+    let heightmap_vi: i32 = 1;  // VarInt(0)
+
+    let data_size_vi: i32 = varint_size(chunk_data_len);
+    let be_count_vi: i32 = 1;  // VarInt(0) for block entities
+
+    // light data: 6x VarInt(0) for empty bitsets and arrays
+    let light_data_size: i32 = 6;
+
+    let payload_size: i32 = 4 + 4 + heightmap_vi + data_size_vi + chunk_data_len + be_count_vi + light_data_size;
+
+    let pkt_id: i32 = 44;  // 0x2C Level Chunk With Light (protocol 774)
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload_size;
+
+    // write the packet
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+
+    // chunk coordinates
+    write_i32(fd, chunk_x);
+    write_i32(fd, chunk_z);
+
+    // heightmaps (empty prefixed array = VarInt 0)
+    write_varint_to_fd(fd, 0);
+
+    // chunk data
+    write_varint_to_fd(fd, chunk_data_len);
+    net_write(fd, section_buf, chunk_data_len);
+
+    // block entities (0)
+    write_varint_to_fd(fd, 0);
+
+    // light data (all empty bitsets/arrays)
+    write_varint_to_fd(fd, 0);  // sky light mask (empty bitset)
+    write_varint_to_fd(fd, 0);  // block light mask
+    write_varint_to_fd(fd, 0);  // empty sky light mask
+    write_varint_to_fd(fd, 0);  // empty block light mask
+    write_varint_to_fd(fd, 0);  // sky light arrays count
+    write_varint_to_fd(fd, 0);  // block light arrays count
+}
+
+// ---------------------------------------------------------------------------
+// chunk batch start/finished packets (0x0C / 0x0B in protocol 774)
+// the MC client needs these to properly handle chunk loading timing
+// ---------------------------------------------------------------------------
+
+fn send_chunk_batch_start(fd: i32) -> void {
+    let pkt_id: i32 = 12;  // 0x0C Chunk Batch Start (protocol 774)
+    let id_len: i32 = varint_size(pkt_id);
+    write_varint_to_fd(fd, id_len);
+    write_varint_to_fd(fd, pkt_id);
+}
+
+fn send_chunk_batch_finished(fd: i32, batch_size: i32) -> void {
+    let pkt_id: i32 = 11;  // 0x0B Chunk Batch Finished (protocol 774)
+    let id_len: i32 = varint_size(pkt_id);
+    let size_vi: i32 = varint_size(batch_size);
+    write_varint_to_fd(fd, id_len + size_vi);
+    write_varint_to_fd(fd, pkt_id);
+    write_varint_to_fd(fd, batch_size);
+}
+
+// ---------------------------------------------------------------------------
+// send chunks around spawn in a grid pattern
+// for now we send a small area around 0,0
+// ---------------------------------------------------------------------------
+
+fn send_spawn_chunks(fd: i32, view_distance: i32) -> void {
+    // send center chunk first
+    send_center_chunk(fd, 0, 0);
+
+    // send chunks in a square around spawn
+    let radius: i32 = 3;  // 7x7 = 49 chunks
+    if (view_distance < radius) {
+        radius = view_distance;
+    }
+
+    // wrap chunks in a batch for proper client handling
+    send_chunk_batch_start(fd);
+
+    let chunk_count: i32 = 0;
+    let cx: i32 = 0 - radius;
+    while (cx <= radius) {
+        let cz: i32 = 0 - radius;
+        while (cz <= radius) {
+            send_chunk_data(fd, cx, cz);
+            chunk_count = chunk_count + 1;
+            cz = cz + 1;
+        }
+        cx = cx + 1;
+    }
+
+    send_chunk_batch_finished(fd, chunk_count);
+}
+
+// ---------------------------------------------------------------------------
+// send all the initial play state packets to get a player into the world
+// returns the entity id assigned to the player
+// ---------------------------------------------------------------------------
+
+fn send_play_login(fd: i32, entity_id: i32) -> void {
+    // 1. send login (play) packet
+    send_login_play(fd, entity_id);
+
+    // 2. game event: start waiting for level chunks (event 13)
+    // value is the wait percentage as float bits... 0 means start
+    send_game_event(fd, 13, 0);
+
+    // 3. set default spawn position (on top of the grass section at y=16)
+    send_spawn_position(fd, 0, 16, 0);
+
+    // 4. send chunks around spawn
+    send_spawn_chunks(fd, 3);
+
+    // 5. teleport player to spawn (y=17 so theyre standing on the grass)
+    send_player_position(fd, 0, 17, 0, 1);
+}
+
+// ---------------------------------------------------------------------------
+// read and handle play state packets from the client
+// returns false if the client disconnected
+// ---------------------------------------------------------------------------
+
+fn handle_play_packet(fd: i32) -> bool {
+    let ready: i32 = net_poll_read(fd, 100);
+    if (ready <= 0) { return true; }  // no data yet, still connected
+
+    let pkt_packed: i32 = read_varint_from_fd(fd);
+    if (pkt_packed < 0) { return false; }
+
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0) { return false; }
+
+    // read the full packet
+    let buf: str = net_make_buf(pkt_len + 1);
+    let total_read: i32 = 0;
+    while (total_read < pkt_len) {
+        let remaining: i32 = pkt_len - total_read;
+        let tmp: str = net_make_buf(remaining + 1);
+        let nr: i32 = net_read(fd, tmp, remaining);
+        if (nr <= 0) { return false; }
+        let k: i32 = 0;
+        while (k < nr) {
+            buf[total_read + k] = tmp[k];
+            k = k + 1;
+        }
+        total_read = total_read + nr;
+    }
+
+    // parse packet id
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    let packet_id: i32 = unpack_varint_value(id_packed);
+
+    // handle known play packets (serverbound IDs for 1.21.11 protocol 774)
+    if (packet_id == 0) {
+        // 0x00 - Confirm Teleportation (accept_teleportation)
+        // client confirms they received our position sync
+        // we dont need to do anything with this rn
+    } else if (packet_id == 8) {
+        // 0x08 - Chat Message
+        // player sent a chat message
+    } else if (packet_id == 10) {
+        // 0x0A - Chunk Batch Received
+        // client acks chunk batch, sends desired chunks per tick (float)
+        // we can ignore this for now
+    } else if (packet_id == 27) {
+        // 0x1B - Keep Alive (serverbound)
+        // client responding to our keep alive - all good
+    } else if (packet_id == 29) {
+        // 0x1D - Set Player Position (move_player_pos)
+        // client moved - track this for multiplayer later
+    } else if (packet_id == 30) {
+        // 0x1E - Set Player Position and Rotation (move_player_pos_rot)
+        // movement + looking
+    } else if (packet_id == 31) {
+        // 0x1F - Set Player Rotation (move_player_rot)
+        // just looking around
+    } else if (packet_id == 32) {
+        // 0x20 - Set Player Movement Flags (move_player_status_only)
+        // client reporting ground state
+    } else if (packet_id == 12) {
+        // 0x0C - Client Tick End (client_tick_end)
+        // sent every tick by the client, no fields
+    } else if (packet_id == 13) {
+        // 0x0D - Client Information (client_information) play state
+        // client settings like render distance, chat mode etc
+    }
+
+    // for now we just eat all packets and stay alive
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// send keep alive packet to prevent timeout
+// Keep Alive (0x2B): i64 keep alive id
+// ---------------------------------------------------------------------------
+
+fn send_keep_alive(fd: i32, keep_alive_id: i32) -> void {
+    let payload: i32 = 8;  // i64
+    let pkt_id: i32 = 43;  // 0x2B Keep Alive (play)
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    write_i64_parts(fd, 0, keep_alive_id);
+}

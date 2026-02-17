@@ -1,0 +1,418 @@
+// ---------------------------------------------------------------------------
+// config_phase.nov - handles the MC configuration phase
+//
+// after the player logs in and acknowledges, we enter the config phase
+// this is where we send all the registry data (dimension types, biomes,
+// chat types, etc) that the client needs before it can enter the world
+//
+// we pre-generate the registry data as binary files in the data/ folder
+// using a python script, then just read and send em here. way easier
+// than trying to build NBT by hand in novus every time lmao
+// ---------------------------------------------------------------------------
+
+module config_phase;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+import ../../lib/file_io;
+import ../logger;
+import packet;
+import writer;
+
+// ---------------------------------------------------------------------------
+// send a binary file as raw bytes to a socket
+// reads the file into a buffer and sends it all at once
+// this is how we send pre-built registry packets without worrying
+// about null bytes in novus strings
+// ---------------------------------------------------------------------------
+
+fn send_binary_file(fd: i32, path: str) -> bool {
+    if (!file_exists(path)) {
+        return false;
+    }
+
+    let ffd: i32 = file_open_read(path);
+    let fsize: u64 = file_size(ffd);
+    file_seek(ffd, 0, 0);
+
+    let size: i32 = u64_to_i32(fsize);
+    if (size <= 0 || size > 65536) {
+        file_close(ffd);
+        return false;
+    }
+
+    // create a buffer and read the file into it
+    let buf: str = net_make_buf(size + 1);
+    file_read(ffd, ptr(buf), size);
+    file_close(ffd);
+
+    // write the buffer to the socket using explicit length
+    net_write(fd, buf, size);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// send a single registry data packet from a pre-built binary file
+// the file contains the packet payload (registry id + entries)
+// we need to wrap it with [length][packet_id=0x07][payload]
+// ---------------------------------------------------------------------------
+
+fn send_registry_from_file(fd: i32, path: str) -> bool {
+    if (!file_exists(path)) {
+        return false;
+    }
+
+    let ffd: i32 = file_open_read(path);
+    let fsize: u64 = file_size(ffd);
+    file_seek(ffd, 0, 0);
+
+    let size: i32 = u64_to_i32(fsize);
+    if (size <= 0 || size > 65536) {
+        file_close(ffd);
+        return false;
+    }
+
+    // read the payload
+    let buf: str = net_make_buf(size + 1);
+    file_read(ffd, ptr(buf), size);
+    file_close(ffd);
+
+    // send as a packet: [VarInt length][VarInt packet_id=7][payload]
+    let id_len: i32 = varint_size(7);
+    let total: i32 = id_len + size;
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, 7);
+    net_write(fd, buf, size);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// send all registry data packets
+// reads each registry binary file and sends it as a framed packet
+// ---------------------------------------------------------------------------
+
+fn send_all_registries(fd: i32) -> bool {
+    // send each registry type - gotta send em all or the client gets mad
+    // the "non-empty" required ones are: dimension_type, biome, damage_type,
+    // painting_variant, wolf_variant, cat_variant, chicken_variant,
+    // cow_variant, frog_variant, pig_variant, wolf_sound_variant,
+    // zombie_nautilus_variant, timeline
+    // we skip enchantment cos the client cant parse those entries from core pack
+    let ok: bool = true;
+
+    if (!send_registry_from_file(fd, "data/reg_dimension_type.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_biome.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_chat_type.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_damage_type.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_painting_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_wolf_variant.bin")) {
+        ok = false;
+    }
+    // mob variant registries - required non-empty in 1.21.11
+    if (!send_registry_from_file(fd, "data/reg_cat_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_chicken_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_cow_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_frog_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_pig_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_wolf_sound_variant.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_zombie_nautilus_variant.bin")) {
+        ok = false;
+    }
+    // timeline registry - needed for day/night cycle stuff
+    if (!send_registry_from_file(fd, "data/reg_timeline.bin")) {
+        ok = false;
+    }
+    // optional registries
+    if (!send_registry_from_file(fd, "data/reg_banner_pattern.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_trim_material.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_trim_pattern.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_instrument.bin")) {
+        ok = false;
+    }
+    if (!send_registry_from_file(fd, "data/reg_jukebox_song.bin")) {
+        ok = false;
+    }
+
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// send Update Tags packet (0x0D in config state)
+// tags group registry entries into named sets
+// ---------------------------------------------------------------------------
+
+fn send_update_tags(fd: i32) -> void {
+    send_binary_packet_from_file(fd, 13, "data/update_tags.bin");
+}
+
+// ---------------------------------------------------------------------------
+// send a binary file as a packet with a specific packet id
+// wraps the file content: [length][packet_id][file_data]
+// ---------------------------------------------------------------------------
+
+fn send_binary_packet_from_file(fd: i32, pkt_id: i32, path: str) -> void {
+    if (!file_exists(path)) {
+        return;
+    }
+
+    let ffd: i32 = file_open_read(path);
+    let fsize: u64 = file_size(ffd);
+    file_seek(ffd, 0, 0);
+
+    let size: i32 = u64_to_i32(fsize);
+    if (size <= 0 || size > 65536) {
+        file_close(ffd);
+        return;
+    }
+
+    let buf: str = net_make_buf(size + 1);
+    file_read(ffd, ptr(buf), size);
+    file_close(ffd);
+
+    let id_len: i32 = varint_size(pkt_id);
+    let total: i32 = id_len + size;
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, pkt_id);
+    net_write(fd, buf, size);
+}
+
+// ---------------------------------------------------------------------------
+// send the finish configuration packet (0x03, empty payload)
+// tells the client "aight we're done with config, lets play"
+// ---------------------------------------------------------------------------
+
+fn send_finish_config(fd: i32) -> void {
+    // packet id 0x03 with no payload
+    // length = 1 (just the packet id varint)
+    write_varint_to_fd(fd, 1);
+    write_varint_to_fd(fd, 3);
+}
+
+// ---------------------------------------------------------------------------
+// send known packs packet (0x0E in config state)
+// tells client what resource packs we know about
+// for vanilla we just send the minecraft:core pack
+// ---------------------------------------------------------------------------
+
+fn send_known_packs(fd: i32) -> void {
+    // Known Packs packet (0x0E):
+    // - VarInt count (1)
+    // - For each: Namespace (string) + ID (string) + Version (string)
+
+    let ns: str = "minecraft";
+    let id: str = "core";
+    let ver: str = "1.21.11";
+
+    let ns_len: i32 = varint_size(len(ns)) + len(ns);
+    let id_len: i32 = varint_size(len(id)) + len(id);
+    let ver_len: i32 = varint_size(len(ver)) + len(ver);
+
+    let payload: i32 = varint_size(1) + ns_len + id_len + ver_len;
+    let pkt_id_len: i32 = varint_size(14);  // 0x0E
+    let total: i32 = pkt_id_len + payload;
+
+    write_varint_to_fd(fd, total);
+    write_varint_to_fd(fd, 14);  // packet id 0x0E
+    write_varint_to_fd(fd, 1);   // count = 1
+    write_mc_string(fd, ns);
+    write_mc_string(fd, id);
+    write_mc_string(fd, ver);
+}
+
+// ---------------------------------------------------------------------------
+// wait for the client to acknowledge finish configuration
+// client sends Acknowledge Finish Configuration (0x03 in config state)
+// returns true if received ok
+// ---------------------------------------------------------------------------
+
+fn wait_finish_config_ack(fd: i32) -> bool {
+    let ready: i32 = net_poll_read(fd, 10000);
+    if (ready <= 0) { return false; }
+
+    let pkt_packed: i32 = read_varint_from_fd(fd);
+    if (pkt_packed < 0) { return false; }
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0) { return false; }
+
+    // read the packet data
+    let buf: str = net_make_buf(pkt_len + 1);
+    let nr: i32 = net_read(fd, buf, pkt_len);
+    if (nr <= 0) { return false; }
+
+    // parse packet id
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    let packet_id: i32 = unpack_varint_value(id_packed);
+
+    // finish config ack is 0x03 in config state serverbound
+    return packet_id == 3;
+}
+
+// ---------------------------------------------------------------------------
+// read and discard a client packet during config phase
+// some clients send stuff like client settings, plugin messages, etc
+// we just eat those packets and move on
+// returns the packet id, or -1 on error
+// ---------------------------------------------------------------------------
+
+fn eat_config_packet(fd: i32) -> i32 {
+    let ready: i32 = net_poll_read(fd, 5000);
+    if (ready <= 0) { return -1; }
+
+    let pkt_packed: i32 = read_varint_from_fd(fd);
+    if (pkt_packed < 0) { return -1; }
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0) { return -1; }
+
+    // read and discard the payload
+    let buf: str = net_make_buf(pkt_len + 1);
+    let total_read: i32 = 0;
+    while (total_read < pkt_len) {
+        let remaining: i32 = pkt_len - total_read;
+        let nr: i32 = net_read(fd, buf, remaining);
+        if (nr <= 0) { return -1; }
+        total_read = total_read + nr;
+    }
+
+    // parse packet id
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    return unpack_varint_value(id_packed);
+}
+
+// same as eat_config_packet but with a short timeout (200ms)
+// used for eating buffered client packets without blocking too long
+fn eat_config_packet_fast(fd: i32) -> i32 {
+    let ready: i32 = net_poll_read(fd, 200);
+    if (ready <= 0) { return -1; }
+
+    let pkt_packed: i32 = read_varint_from_fd(fd);
+    if (pkt_packed < 0) { return -1; }
+    let pkt_len: i32 = unpack_varint_value(pkt_packed);
+    if (pkt_len <= 0) { return -1; }
+
+    let buf: str = net_make_buf(pkt_len + 1);
+    let total_read: i32 = 0;
+    while (total_read < pkt_len) {
+        let remaining: i32 = pkt_len - total_read;
+        let nr: i32 = net_read(fd, buf, remaining);
+        if (nr <= 0) { return -1; }
+        total_read = total_read + nr;
+    }
+
+    let id_packed: i32 = read_varint_packed(buf, 0, pkt_len);
+    return unpack_varint_value(id_packed);
+}
+
+// ---------------------------------------------------------------------------
+// handle the entire configuration phase
+// the correct flow per the MC protocol is:
+// 1. eat any client packets (client info, plugin messages etc)
+// 2. server sends Known Packs
+// 3. client responds with Known Packs
+// 4. server sends Registry Data (multiple packets)
+// 5. server sends Finish Configuration
+// 6. client acks Finish Configuration
+//
+// the real MC client can send multiple packets before we start
+// (client info, plugin channel, brand, etc) so we gotta eat em all
+// ---------------------------------------------------------------------------
+
+fn handle_config_phase(fd: i32) -> bool {
+    // per the MC protocol, the server should send Known Packs immediately
+    // the client may send packets like client_information at any point
+    // but we dont need to wait for those before starting
+
+    // step 1: send Known Packs right away
+    send_known_packs(fd);
+    log_debug("config: sent known packs");
+
+    // step 2: read client responses
+    // the client will send some combo of: client_information (0x00),
+    // plugin_message (0x02), and known_packs_response (0x07)
+    // we need to eat everything until we get the known packs response
+    let got_known_packs: bool = false;
+    let attempts: i32 = 0;
+    while (!got_known_packs) {
+        let pkt: i32 = eat_config_packet(fd);
+        log_debug("config: received packet 0x" + i32_to_str(pkt));
+        if (pkt == 7) {
+            got_known_packs = true;
+            log_debug("config: got known packs response");
+        } else if (pkt < 0) {
+            log_debug("config: connection lost waiting for known packs response");
+            return false;
+        }
+        // any other packet (0x00 client info, 0x02 plugin msg) we just discard
+        attempts = attempts + 1;
+        if (attempts > 20) {
+            log_debug("config: too many packets before known packs response");
+            return false;
+        }
+    }
+
+    // step 3: send all registry data
+    let ok: bool = send_all_registries(fd);
+    if (!ok) {
+        log_debug("config: failed to send registries");
+        return false;
+    }
+    log_debug("config: sent all registries");
+
+    // step 4: send Update Tags (required for timeline tags etc)
+    send_update_tags(fd);
+    log_debug("config: sent update tags");
+
+    // step 5: send finish configuration
+    send_finish_config(fd);
+    log_debug("config: sent finish config");
+
+    // step 6: wait for client to acknowledge
+    // the client might send more packets before the ack (like resource pack status)
+    // so we loop and eat packets until we get the finish config ack (0x03)
+    let ack_attempts: i32 = 0;
+    while (ack_attempts < 20) {
+        let ack_pkt: i32 = eat_config_packet(fd);
+        log_debug("config: waiting for ack, got packet 0x" + i32_to_str(ack_pkt));
+        if (ack_pkt == 3) {
+            log_debug("config: got finish config ack");
+            return true;
+        }
+        if (ack_pkt < 0) {
+            log_debug("config: connection lost waiting for ack");
+            return false;
+        }
+        ack_attempts = ack_attempts + 1;
+    }
+
+    log_debug("config: gave up waiting for finish config ack");
+    return false;
+}

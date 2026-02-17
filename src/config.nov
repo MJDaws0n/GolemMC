@@ -1,0 +1,200 @@
+// ---------------------------------------------------------------------------
+// config.nov - server configuration management
+// generates and loads the server.properties file
+// basically all the settings for your server live here
+// if the file doesnt exist we make one with some fire defaults
+//
+// cause novus globals dont play nice across modules rn, we read the
+// config file fresh each time we need a value. its a bit wasteful
+// but it works and config reads are rare enough that it dont matter
+// ---------------------------------------------------------------------------
+
+module config;
+
+import ../lib/standard_lib;
+import ../lib/standard_lib_macos_silicon;
+import ../lib/file_io;
+import ../lib/memory;
+
+// ---------------------------------------------------------------------------
+// read the entire config file into a string
+// ---------------------------------------------------------------------------
+
+fn config_read_file() -> str {
+    let path: str = "server.properties";
+    if (!file_exists(path)) { return ""; }
+
+    let fd: i32 = file_open_read(path);
+    let fsize: u64 = file_size(fd);
+    if (fsize == 0) {
+        file_close(fd);
+        return "";
+    }
+
+    file_seek(fd, 0, 0);
+    let buf_size: i32 = u64_to_i32(fsize);
+    if (buf_size <= 0 || buf_size > 65536) {
+        file_close(fd);
+        return "";
+    }
+    let buf: str = "";
+    let i: i32 = 0;
+    while (i < buf_size) {
+        buf = buf + " ";
+        i = i + 1;
+    }
+    file_read(fd, ptr(buf), buf_size);
+    file_close(fd);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// find a value for a key in the config string
+// ---------------------------------------------------------------------------
+
+fn config_find_value(content: str, key: str) -> str {
+    let search: str = key + "=";
+    let pos: i32 = str_find(content, search);
+    if (pos < 0) { return ""; }
+
+    // move past the key=
+    let start: i32 = pos + len(search);
+    let val: str = "";
+    let i: i32 = start;
+    while (i < len(content)) {
+        if (content[i] == '\n' || content[i] == '\r') {
+            break;
+        }
+        val = val + content[i];
+        i = i + 1;
+    }
+    return val;
+}
+
+// ---------------------------------------------------------------------------
+// getters - read fresh from file each time
+// ---------------------------------------------------------------------------
+
+fn config_get_port() -> i32 {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return 25565; }
+    let val: str = config_find_value(content, "server-port");
+    if (len(val) == 0) { return 25565; }
+    return str_to_i32(val);
+}
+
+fn config_get_motd() -> str {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return "A GolemMC Server"; }
+    let val: str = config_find_value(content, "motd");
+    if (len(val) == 0) { return "A GolemMC Server"; }
+    return val;
+}
+
+fn config_get_max_players() -> i32 {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return 20; }
+    let val: str = config_find_value(content, "max-players");
+    if (len(val) == 0) { return 20; }
+    return str_to_i32(val);
+}
+
+fn config_get_world_name() -> str {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return "world"; }
+    let val: str = config_find_value(content, "world-name");
+    if (len(val) == 0) { return "world"; }
+    return val;
+}
+
+fn config_get_seed() -> str {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return ""; }
+    return config_find_value(content, "seed");
+}
+
+fn config_get_gamemode() -> str {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return "survival"; }
+    let val: str = config_find_value(content, "gamemode");
+    if (len(val) == 0) { return "survival"; }
+    return val;
+}
+
+fn config_get_difficulty() -> str {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return "normal"; }
+    let val: str = config_find_value(content, "difficulty");
+    if (len(val) == 0) { return "normal"; }
+    return val;
+}
+
+fn config_get_view_distance() -> i32 {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return 10; }
+    let val: str = config_find_value(content, "view-distance");
+    if (len(val) == 0) { return 10; }
+    return str_to_i32(val);
+}
+
+fn config_get_online_mode() -> bool {
+    let content: str = config_read_file();
+    if (len(content) == 0) { return true; }
+    let val: str = config_find_value(content, "online-mode");
+    if (val == "false") { return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// generate a random seed from the current time
+// ---------------------------------------------------------------------------
+
+fn generate_seed() -> str {
+    let ns: i64 = get_time_ns();
+    return i64_to_str(ns);
+}
+
+// ---------------------------------------------------------------------------
+// write default config file
+// ---------------------------------------------------------------------------
+
+fn config_write_defaults(path: str) -> void {
+    let seed: str = generate_seed();
+
+    let fd: i32 = file_open_write(path);
+    if (fd < 0) {
+        print("ERROR: couldnt create server.properties rip");
+        return;
+    }
+
+    file_write_str(fd, "# GolemMC Server Properties\n");
+    file_write_str(fd, "# auto-generated config - edit however u want\n");
+    file_write_str(fd, "\n");
+    file_write_str(fd, "server-port=25565\n");
+    file_write_str(fd, "motd=A GolemMC 67 Server\n");
+    file_write_str(fd, "max-players=67\n");
+    file_write_str(fd, "world-name=world\n");
+    file_write_str(fd, "seed=" + seed + "\n");
+    file_write_str(fd, "gamemode=survival\n");
+    file_write_str(fd, "difficulty=normal\n");
+    file_write_str(fd, "view-distance=10\n");
+    file_write_str(fd, "online-mode=true\n");
+
+    file_close(fd);
+    print("server.properties created with seed: " + seed);
+}
+
+// ---------------------------------------------------------------------------
+// main config init - checks if config exists, generates defaults if not
+// ---------------------------------------------------------------------------
+
+fn config_init() -> void {
+    let path: str = "server.properties";
+
+    if (file_exists(path)) {
+        print("loaded server.properties");
+    } else {
+        print("no server.properties found, creating defaults...");
+        config_write_defaults(path);
+    }
+}

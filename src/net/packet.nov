@@ -1,0 +1,195 @@
+// ---------------------------------------------------------------------------
+// packet.nov - minecraft packet reading and writing
+// handles VarInt encoding/decoding and packet framing
+// 
+// IMPORTANT: we cant use regular string concat for binary data as novus
+// strings are null-terminated (C-style) and VarInts can contain \x00 bytes
+// which would truncate the string. so we write bytes directly to the socket
+// ---------------------------------------------------------------------------
+
+module packet;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+import ../../lib/memory;
+
+// ---------------------------------------------------------------------------
+// read a single byte from a string buffer as unsigned 0-255
+// ---------------------------------------------------------------------------
+
+fn buf_byte(buf: str, idx: i32) -> i32 {
+    let raw: i32 = buf[idx];
+    return raw & 255;
+}
+
+// ---------------------------------------------------------------------------
+// VarInt reading - packed return format
+// returns (actual_value * 16) + bytes_consumed
+// caller uses unpack_varint_value and unpack_varint_size to extract
+// ---------------------------------------------------------------------------
+
+fn read_varint_packed(buf: str, pos: i32, max_pos: i32) -> i32 {
+    let result: i32 = 0;
+    let shift: i32 = 0;
+    let bytes: i32 = 0;
+
+    while (pos + bytes < max_pos && bytes < 5) {
+        let b: i32 = buf_byte(buf, pos + bytes);
+        let val: i32 = b & 127;
+
+        result = result | (val << shift);
+        bytes = bytes + 1;
+
+        if ((b & 128) == 0) {
+            return result * 16 + bytes;
+        }
+
+        shift = shift + 7;
+    }
+
+    return result * 16 + bytes;
+}
+
+fn unpack_varint_value(packed: i32) -> i32 {
+    return packed >> 4;
+}
+
+fn unpack_varint_size(packed: i32) -> i32 {
+    return packed & 15;
+}
+
+// ---------------------------------------------------------------------------
+// VarInt size calculation - how many bytes a value needs
+// ---------------------------------------------------------------------------
+
+fn varint_size(value: i32) -> i32 {
+    if (value < 0) { return 5; }
+    if (value < 128) { return 1; }
+    if (value < 16384) { return 2; }
+    if (value < 2097152) { return 3; }
+    if (value < 268435456) { return 4; }
+    return 5;
+}
+
+// ---------------------------------------------------------------------------
+// write a VarInt directly to a socket fd
+// returns number of bytes written
+// ---------------------------------------------------------------------------
+
+fn write_varint_to_fd(fd: i32, value: i32) -> i32 {
+    let v: i32 = value;
+    let count: i32 = 0;
+    let one: str = "\0";
+
+    while (count < 5) {
+        let b: i32 = v & 127;
+        v = (v >> 7) & 33554431;  // unsigned right shift (mask off sign extension)
+
+        if (v != 0) {
+            b = b | 128;
+        }
+
+        one[0] = b;
+        net_write(fd, one, 1);
+        count = count + 1;
+
+        if (v == 0) {
+            break;
+        }
+    }
+
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// write raw bytes from a string to a socket
+// ---------------------------------------------------------------------------
+
+fn write_raw(client_fd: i32, data: str, length: i32) -> i32 {
+    return net_write(client_fd, data, length);
+}
+
+// ---------------------------------------------------------------------------
+// write a string byte-by-byte to socket (to handle null bytes)
+// uses the actual string length, not len() which stops at \0
+// ---------------------------------------------------------------------------
+
+fn write_str_to_fd(fd: i32, s: str, length: i32) -> i32 {
+    return net_write(fd, s, length);
+}
+
+// ---------------------------------------------------------------------------
+// send a complete MC packet to a socket
+// packet = [VarInt total_length][VarInt packet_id][payload]
+// we write each part directly to avoid null byte issues in strings
+// ---------------------------------------------------------------------------
+
+fn send_packet(fd: i32, packet_id: i32, payload: str, payload_len: i32) -> void {
+    let id_len: i32 = varint_size(packet_id);
+    let total_inner: i32 = id_len + payload_len;
+
+    // write the packet length varint
+    write_varint_to_fd(fd, total_inner);
+    // write the packet id varint
+    write_varint_to_fd(fd, packet_id);
+    // write the payload
+    if (payload_len > 0) {
+        write_str_to_fd(fd, payload, payload_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// send a MC string packet (status response)
+// MC string = [VarInt string_length][UTF-8 bytes]
+// wraps it in a packet with the given id
+// ---------------------------------------------------------------------------
+
+fn send_string_packet(fd: i32, packet_id: i32, s: str) -> void {
+    let slen: i32 = len(s);
+    let slen_vi: i32 = varint_size(slen);
+    let id_len: i32 = varint_size(packet_id);
+    let total_inner: i32 = id_len + slen_vi + slen;
+
+    // write packet length
+    write_varint_to_fd(fd, total_inner);
+    // write packet id
+    write_varint_to_fd(fd, packet_id);
+    // write string length
+    write_varint_to_fd(fd, slen);
+    // write string data
+    write_str_to_fd(fd, s, slen);
+}
+
+// ---------------------------------------------------------------------------
+// read a VarInt directly from a socket fd (byte by byte)
+// returns packed value (value * 16 + bytes_read), or -1 on error
+// ---------------------------------------------------------------------------
+
+fn read_varint_from_fd(fd: i32) -> i32 {
+    let result: i32 = 0;
+    let shift: i32 = 0;
+    let bytes: i32 = 0;
+    let one_byte: str = "\0";
+
+    while (bytes < 5) {
+        let nr: i32 = net_read(fd, one_byte, 1);
+        if (nr <= 0) {
+            return -1;
+        }
+
+        let b: i32 = buf_byte(one_byte, 0);
+        let val: i32 = b & 127;
+
+        result = result | (val << shift);
+        bytes = bytes + 1;
+
+        if ((b & 128) == 0) {
+            return result * 16 + bytes;
+        }
+
+        shift = shift + 7;
+    }
+
+    return result * 16 + bytes;
+}

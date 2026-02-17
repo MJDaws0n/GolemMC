@@ -1,0 +1,63 @@
+// ---------------------------------------------------------------------------
+// world.nov - world folder generation
+// creates the world directory and a basic level.dat style file
+// rn its pretty minimal but itll get the job done
+// we just need the folder to exist and have seed info basically
+// ---------------------------------------------------------------------------
+
+module world;
+
+import ../lib/standard_lib;
+import ../lib/standard_lib_macos_silicon;
+import ../lib/file_io;
+import ../lib/memory;
+import config;
+
+// ---------------------------------------------------------------------------
+// create the world directory and seed file
+// ---------------------------------------------------------------------------
+
+fn world_init() -> void {
+    let world_name: str = config_get_world_name();
+
+    // try to create the world directory (0755 = 493)
+    let rc: i32 = sys_mkdir(world_name, 493);
+
+    // check if the seed file already exists
+    let seed_path: str = world_name + "/seed.txt";
+
+    if (file_exists(seed_path)) {
+        // world already exists, we're good
+        log_info("loaded world '" + world_name + "'");
+        return;
+    }
+
+    // new world - write the seed file
+    log_info("generating new world '" + world_name + "'...");
+
+    let seed: str = config_get_seed();
+    let sfd: i32 = file_open_write(seed_path);
+    if (sfd >= 0) {
+        file_write_str(sfd, seed + "\n");
+        file_close(sfd);
+    }
+
+    // create region directory for future chunk storage
+    sys_mkdir(world_name + "/region", 493);
+
+    // write a basic level info file
+    let level_path: str = world_name + "/level.txt";
+    let lfd: i32 = file_open_write(level_path);
+    if (lfd >= 0) {
+        file_write_str(lfd, "# GolemMC World Data\n");
+        file_write_str(lfd, "seed=" + seed + "\n");
+        file_write_str(lfd, "gamemode=" + config_get_gamemode() + "\n");
+        file_write_str(lfd, "difficulty=" + config_get_difficulty() + "\n");
+        file_write_str(lfd, "spawn-x=0\n");
+        file_write_str(lfd, "spawn-y=64\n");
+        file_write_str(lfd, "spawn-z=0\n");
+        file_close(lfd);
+    }
+
+    log_info("world '" + world_name + "' created with seed: " + seed);
+}

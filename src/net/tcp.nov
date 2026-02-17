@@ -1,0 +1,68 @@
+// ---------------------------------------------------------------------------
+// tcp.nov - TCP server wrapper for golemmc
+// wraps the raw net lib into something usable for our mc server
+// handles creating, binding, and managing the listener socket
+// ---------------------------------------------------------------------------
+
+module tcp;
+
+import ../../lib/standard_lib;
+import ../../lib/standard_lib_macos_silicon;
+import ../../lib/net;
+
+// ---------------------------------------------------------------------------
+// start the TCP server on the given port
+// returns the server socket fd, or -1 on failure
+// ---------------------------------------------------------------------------
+
+fn tcp_start(port: i32) -> i32 {
+    let fd: i32 = net_socket();
+    if (fd < 0) {
+        return -1;
+    }
+
+    net_set_reuse(fd);
+
+    let rc: i32 = net_bind(fd, port);
+    if (rc != 0) {
+        net_close(fd);
+        return -1;
+    }
+
+    rc = net_listen(fd, 16);
+    if (rc != 0) {
+        net_close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
+// check if theres a new connection waiting (non-blocking)
+// returns client fd if yes, -1 if no connection pending
+// ---------------------------------------------------------------------------
+
+fn tcp_accept_poll(server_fd: i32, timeout_ms: i32) -> i32 {
+    if (server_fd < 0) { return -1; }
+
+    let ready: i32 = net_poll_read(server_fd, timeout_ms);
+    if (ready <= 0) { return -1; }
+
+    let client_fd: i32 = net_accept(server_fd);
+    if (client_fd >= 0) {
+        // prevent SIGPIPE on this socket
+        net_set_nosigpipe(client_fd);
+    }
+    return client_fd;
+}
+
+// ---------------------------------------------------------------------------
+// stop the TCP server
+// ---------------------------------------------------------------------------
+
+fn tcp_stop(server_fd: i32) -> void {
+    if (server_fd >= 0) {
+        net_close(server_fd);
+    }
+}

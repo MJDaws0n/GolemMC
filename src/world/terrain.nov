@@ -25,17 +25,17 @@ fn BLOCK_GRASS_BLOCK() -> i32 { return 9; }       // snowy=false
 fn BLOCK_DIRT() -> i32 { return 10; }
 fn BLOCK_COARSE_DIRT() -> i32 { return 11; }
 fn BLOCK_COBBLESTONE() -> i32 { return 14; }
-fn BLOCK_BEDROCK() -> i32 { return 33; }
-fn BLOCK_WATER() -> i32 { return 80; }            // level=0
-fn BLOCK_SAND() -> i32 { return 115; }
-fn BLOCK_GRAVEL() -> i32 { return 116; }
-fn BLOCK_COAL_ORE() -> i32 { return 129; }
+fn BLOCK_BEDROCK() -> i32 { return 85; }
+fn BLOCK_WATER() -> i32 { return 86; }            // level=0
+fn BLOCK_SAND() -> i32 { return 118; }
+fn BLOCK_GRAVEL() -> i32 { return 124; }
+fn BLOCK_COAL_ORE() -> i32 { return 133; }
 fn BLOCK_IRON_ORE() -> i32 { return 131; }
-fn BLOCK_GOLD_ORE() -> i32 { return 135; }
-fn BLOCK_DIAMOND_ORE() -> i32 { return 3551; }
-fn BLOCK_OAK_LOG() -> i32 { return 117; }         // axis=y
-fn BLOCK_OAK_LEAVES() -> i32 { return 228; }      // distance=7, persistent=false, waterlogged=false
-fn BLOCK_SNOW_BLOCK() -> i32 { return 3986; }
+fn BLOCK_GOLD_ORE() -> i32 { return 129; }
+fn BLOCK_DIAMOND_ORE() -> i32 { return 5106; }
+fn BLOCK_OAK_LOG() -> i32 { return 137; }         // axis=y
+fn BLOCK_OAK_LEAVES() -> i32 { return 279; }      // distance=7, persistent=false, waterlogged=false
+fn BLOCK_SNOW_BLOCK() -> i32 { return 6727; }
 
 // sea level - water fills up to here
 fn SEA_LEVEL() -> i32 { return 62; }

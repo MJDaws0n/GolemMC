@@ -101,7 +101,7 @@ fn send_login_play(fd: i32, entity_id: i32) -> void {
     write_byte(fd, 1);              // game mode (1 = creative)
     write_byte(fd, 255);            // previous game mode (-1 as unsigned byte)
     write_bool(fd, false);          // is debug world
-    write_bool(fd, true);           // is flat world
+    write_bool(fd, false);          // is flat world (not flat - we have terrain!)
     write_bool(fd, false);          // has death location
     write_varint_to_fd(fd, 0);      // portal cooldown
     write_varint_to_fd(fd, 63);     // sea level
@@ -235,7 +235,7 @@ fn send_center_chunk(fd: i32, chunk_x: i32, chunk_z: i32) -> void {
 // grass at y=0, air above. a 1-layer grass world
 // ---------------------------------------------------------------------------
 
-fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str) -> void {
+fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: i32) -> void {
     // Chunk Data and Update Light packet (0x2C in protocol 774)
     //
     // builds chunk section data from the chunk storage system
@@ -311,7 +311,7 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str) -> voi
                 while (ly < 16) {
                     let lz: i32 = 0;
                     while (lz < 16) {
-                        let bid: i32 = chunk_get_section_block(cs, chunk_x, chunk_z, section, lx, ly, lz);
+                        let bid: i32 = chunk_get_section_block_seed(cs, chunk_x, chunk_z, section, lx, ly, lz, seed);
                         if (bid != 0) { non_air = non_air + 1; }
 
                         // store in cache: index = (ly * 256 + lz * 16 + lx) * 2
@@ -536,8 +536,17 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str) -> voi
     let data_size_vi: i32 = varint_size(chunk_data_len);
     let be_count_vi: i32 = 1;  // VarInt(0) for block entities
 
-    // light data: 6x VarInt(0) for empty bitsets and arrays
-    let light_data_size: i32 = 6;
+    // light data - send full sky light for all 26 sections (24 + 2 boundary)
+    // sky light mask: BitSet with all 26 bits set = 1 long = 0x03FFFFFF
+    // sky light mask size: VarInt(1) + 8 bytes = 9
+    // block light mask: VarInt(0) = 1
+    // empty sky light mask: VarInt(0) = 1
+    // empty block light mask: VarInt(0) = 1
+    // sky light arrays: VarInt(26) + 26 * (VarInt(2048) + 2048 bytes)
+    // block light arrays: VarInt(0) = 1
+    let sky_arrays_size: i32 = varint_size(26);
+    let per_array: i32 = varint_size(2048) + 2048;
+    let light_data_size: i32 = 9 + 1 + 1 + 1 + sky_arrays_size + 26 * per_array + 1;
 
     let payload_size: i32 = 4 + 4 + heightmap_vi + data_size_vi + chunk_data_len + be_count_vi + light_data_size;
 
@@ -563,13 +572,43 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str) -> voi
     // block entities (0)
     write_varint_to_fd(fd, 0);
 
-    // light data (all empty bitsets/arrays)
-    write_varint_to_fd(fd, 0);  // sky light mask (empty bitset)
-    write_varint_to_fd(fd, 0);  // block light mask
-    write_varint_to_fd(fd, 0);  // empty sky light mask
-    write_varint_to_fd(fd, 0);  // empty block light mask
-    write_varint_to_fd(fd, 0);  // sky light arrays count
-    write_varint_to_fd(fd, 0);  // block light arrays count
+    // --- light data ---
+    // sky light mask: BitSet with 1 long, all 26 bits set
+    write_varint_to_fd(fd, 1);  // 1 long in bitset
+    // value = 0x03FFFFFF (bits 0-25 set) as big-endian i64
+    // high 32 bits = 0, low 32 bits = 0x03FFFFFF = 67108863
+    write_i32(fd, 0);
+    write_i32(fd, 67108863);
+
+    // block light mask (empty bitset)
+    write_varint_to_fd(fd, 0);
+
+    // empty sky light mask (empty bitset)
+    write_varint_to_fd(fd, 0);
+
+    // empty block light mask (empty bitset)
+    write_varint_to_fd(fd, 0);
+
+    // sky light arrays: 26 arrays, each 2048 bytes of 0xFF (full brightness)
+    write_varint_to_fd(fd, 26);
+
+    // build one full-brightness light array in work buffer at offset 0
+    // (safe cos we already sent section_buf data above)
+    let li: i32 = 0;
+    while (li < 2048) {
+        wb[li] = 255;
+        li = li + 1;
+    }
+
+    let si: i32 = 0;
+    while (si < 26) {
+        write_varint_to_fd(fd, 2048);
+        net_write(fd, wb, 2048);
+        si = si + 1;
+    }
+
+    // block light arrays (empty)
+    write_varint_to_fd(fd, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +637,7 @@ fn send_chunk_batch_finished(fd: i32, batch_size: i32) -> void {
 // for now we send a small area around 0,0
 // ---------------------------------------------------------------------------
 
-fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str) -> void {
+fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str, seed: i32) -> void {
     // send center chunk first
     send_center_chunk(fd, 0, 0);
 
@@ -616,7 +655,7 @@ fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str) -> void {
     while (cx <= radius) {
         let cz: i32 = 0 - radius;
         while (cz <= radius) {
-            send_chunk_data(fd, cx, cz, cs, wb);
+            send_chunk_data(fd, cx, cz, cs, wb, seed);
             chunk_count = chunk_count + 1;
             cz = cz + 1;
         }
@@ -631,7 +670,7 @@ fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str) -> void {
 // returns the entity id assigned to the player
 // ---------------------------------------------------------------------------
 
-fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str) -> void {
+fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str, seed: i32) -> void {
     // 1. send login (play) packet
     send_login_play(fd, entity_id);
 
@@ -640,14 +679,13 @@ fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str) -> void {
     send_game_event(fd, 13, 0);
 
     // 3. figure out spawn height from terrain generation
-    let spawn_seed: i32 = cs_seed(cs);
-    let spawn_y: i32 = terrain_height(0, 0, spawn_seed) + 1;
+    let spawn_y: i32 = terrain_height(0, 0, seed) + 1;
 
     // 3. set default spawn position
     send_spawn_position(fd, 0, spawn_y, 0);
 
     // 4. send chunks around spawn
-    send_spawn_chunks(fd, 3, cs, wb);
+    send_spawn_chunks(fd, 3, cs, wb, seed);
 
     // 5. teleport player to spawn (on top of the terrain)
     send_player_position(fd, 0, spawn_y + 1, 0, 1);

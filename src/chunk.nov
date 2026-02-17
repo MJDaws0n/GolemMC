@@ -316,6 +316,14 @@ fn chunk_get_section_block(state: str, chunk_x: i32, chunk_z: i32, section_idx: 
     return chunk_get_block(state, world_x, world_y, world_z);
 }
 
+// same as above but with explicit seed (avoids corrupted state reads)
+fn chunk_get_section_block_seed(state: str, chunk_x: i32, chunk_z: i32, section_idx: i32, local_x: i32, local_y: i32, local_z: i32, seed: i32) -> i32 {
+    let world_x: i32 = chunk_x * 16 + local_x;
+    let world_y: i32 = (section_idx - 4) * 16 + local_y;
+    let world_z: i32 = chunk_z * 16 + local_z;
+    return chunk_get_block_seed(state, world_x, world_y, world_z, seed);
+}
+
 // ---------------------------------------------------------------------------
 // check if a chunk section is uniform (all same block)
 // returns the block id if uniform, or -1 if mixed

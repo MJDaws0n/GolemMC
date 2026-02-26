@@ -11,11 +11,13 @@
 
 module play;
 
-import ../../lib/standard_lib;
-import ../../lib/standard_lib_macos_silicon;
-import ../../lib/net;
+import ../../lib/std/main;
+import ../../lib/net/main;
 import ../chunk;
 import ../world/terrain;
+import ../game/items;
+import ../game/blocks;
+import ../config;
 import packet;
 import writer;
 
@@ -25,7 +27,7 @@ import writer;
 // the world theyre joining
 // ---------------------------------------------------------------------------
 
-fn send_login_play(fd: i32, entity_id: i32) -> void {
+fn send_login_play(fd: i32, entity_id: i32, vd: i32) -> void {
     // Login (Play) packet fields for 1.21.11:
     // - Entity ID: i32
     // - Is Hardcore: bool
@@ -53,6 +55,8 @@ fn send_login_play(fd: i32, entity_id: i32) -> void {
     let dim_name: str = "minecraft:overworld";
     let dim_name_size: i32 = varint_size(len(dim_name)) + len(dim_name);
 
+    let vd_size: i32 = varint_size(vd);
+
     // calculate payload size
     let payload: i32 = 0;
     payload = payload + 4;              // entity id (i32)
@@ -60,8 +64,8 @@ fn send_login_play(fd: i32, entity_id: i32) -> void {
     payload = payload + varint_size(1); // dimension count
     payload = payload + dim_name_size;  // dimension name array (1 entry)
     payload = payload + varint_size(20); // max players
-    payload = payload + varint_size(10); // view distance
-    payload = payload + varint_size(10); // simulation distance
+    payload = payload + vd_size;        // view distance
+    payload = payload + vd_size;        // simulation distance
     payload = payload + 1;              // reduced debug info
     payload = payload + 1;              // enable respawn screen
     payload = payload + 1;              // do limited crafting
@@ -90,8 +94,8 @@ fn send_login_play(fd: i32, entity_id: i32) -> void {
     write_varint_to_fd(fd, 1);      // 1 dimension
     write_mc_string(fd, dim_name);  // dimension name
     write_varint_to_fd(fd, 20);     // max players (ignored)
-    write_varint_to_fd(fd, 10);     // view distance
-    write_varint_to_fd(fd, 10);     // simulation distance
+    write_varint_to_fd(fd, vd);     // view distance
+    write_varint_to_fd(fd, vd);     // simulation distance
     write_bool(fd, false);          // reduced debug info
     write_bool(fd, true);           // enable respawn screen
     write_bool(fd, false);          // do limited crafting
@@ -246,7 +250,8 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
     // mixed sections use indirect palette with packed data
 
     // === USE PRE-ALLOCATED WORK BUFFER to avoid novus memory corruption ===
-    // partition: [0..131071] = section_buf, [131072..139263] = block_cache, [139264..139775] = palette
+    // partition: [0..131071] = section_buf, [131072..139263] = block_cache,
+    //            [139264..139775] = palette, [140000..141023] = height_cache
     let section_buf: str = wb;
     let pos: i32 = 0;
 
@@ -254,8 +259,50 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
     let cache_off: i32 = 131072;
     // palette offset in the work buffer: 139264
     let pal_off: i32 = 139264;
+    // height cache offset: 140000 (256 heights × 4 bytes = 1024 bytes)
+    let hc_off: i32 = 140000;
+
+    // pre-compute terrain heights for all 16x16 columns in this chunk
+    // massively reduces redundant noise computation across sections
+    let hx: i32 = 0;
+    while (hx < 16) {
+        let hz: i32 = 0;
+        while (hz < 16) {
+            let wx: i32 = chunk_x * 16 + hx;
+            let wz: i32 = chunk_z * 16 + hz;
+            let th: i32 = terrain_height(wx, wz, seed);
+            let hi: i32 = hc_off + (hx * 16 + hz) * 4;
+            buf_write_i32(wb, hi, th);
+            hz = hz + 1;
+        }
+        hx = hx + 1;
+    }
 
     // 24 sections for overworld (y -64 to 319)
+    // first, sample terrain heights at corners + center to estimate height range
+    // this lets us skip sections that are clearly all-air or all-underground
+    let bx: i32 = chunk_x * 16;
+    let bz: i32 = chunk_z * 16;
+    let h0: i32 = terrain_height(bx, bz, seed);
+    let h1: i32 = terrain_height(bx + 15, bz, seed);
+    let h2: i32 = terrain_height(bx, bz + 15, seed);
+    let h3: i32 = terrain_height(bx + 15, bz + 15, seed);
+    let h4: i32 = terrain_height(bx + 8, bz + 8, seed);
+    // find min and max surface height in this chunk
+    let min_h: i32 = h0;
+    if (h1 < min_h) { min_h = h1; }
+    if (h2 < min_h) { min_h = h2; }
+    if (h3 < min_h) { min_h = h3; }
+    if (h4 < min_h) { min_h = h4; }
+    let max_h: i32 = h0;
+    if (h1 > max_h) { max_h = h1; }
+    if (h2 > max_h) { max_h = h2; }
+    if (h3 > max_h) { max_h = h3; }
+    if (h4 > max_h) { max_h = h4; }
+    // add margin for hills between sample points and trees
+    min_h = min_h - 16;
+    max_h = max_h + 24;
+
     let section: i32 = 0;
     while (section < 24) {
         let base_y: i32 = (section - 4) * 16;
@@ -264,9 +311,9 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
         let pal_count: i32 = 0;
         let non_air: i32 = 0;
 
-        // shortcut for sections way above terrain (all air)
+        // shortcut for sections clearly above terrain (all air)
         let is_high_air: bool = false;
-        if (base_y >= 200) {
+        if (base_y > max_h) {
             // check no modifications in this section
             let count: i32 = cs_count(cs);
             let has_mods_h: bool = false;
@@ -311,7 +358,10 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
                 while (ly < 16) {
                     let lz: i32 = 0;
                     while (lz < 16) {
-                        let bid: i32 = chunk_get_section_block_seed(cs, chunk_x, chunk_z, section, lx, ly, lz, seed);
+                        // read cached height for this column
+                        let chi: i32 = hc_off + (lx * 16 + lz) * 4;
+                        let col_h: i32 = buf_read_i32(wb, chi);
+                        let bid: i32 = chunk_get_section_block_seed_h(cs, chunk_x, chunk_z, section, lx, ly, lz, seed, col_h);
                         if (bid != 0) { non_air = non_air + 1; }
 
                         // store in cache: index = (ly * 256 + lz * 16 + lx) * 2
@@ -633,33 +683,49 @@ fn send_chunk_batch_finished(fd: i32, batch_size: i32) -> void {
 }
 
 // ---------------------------------------------------------------------------
-// send chunks around spawn in a grid pattern
-// for now we send a small area around 0,0
+// send chunks around spawn in expanding rings
+// sends inner chunks first so the player sees terrain faster
 // ---------------------------------------------------------------------------
 
 fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str, seed: i32) -> void {
     // send center chunk first
     send_center_chunk(fd, 0, 0);
 
-    // send chunks in a square around spawn
-    let radius: i32 = 3;  // 7x7 = 49 chunks
-    if (view_distance < radius) {
-        radius = view_distance;
-    }
+    let radius: i32 = view_distance;
 
-    // wrap chunks in a batch for proper client handling
+    // send all chunks in one batch but in ring order (inside-out)
+    // this way inner chunks reach the client first
     send_chunk_batch_start(fd);
 
     let chunk_count: i32 = 0;
-    let cx: i32 = 0 - radius;
-    while (cx <= radius) {
-        let cz: i32 = 0 - radius;
-        while (cz <= radius) {
-            send_chunk_data(fd, cx, cz, cs, wb, seed);
+    let ring: i32 = 0;
+    while (ring <= radius) {
+        if (ring == 0) {
+            // center chunk
+            send_chunk_data(fd, 0, 0, cs, wb, seed);
             chunk_count = chunk_count + 1;
-            cz = cz + 1;
+        } else {
+            // send the ring at distance 'ring' from center
+            // top and bottom rows
+            let rx: i32 = 0 - ring;
+            while (rx <= ring) {
+                send_chunk_data(fd, rx, 0 - ring, cs, wb, seed);
+                chunk_count = chunk_count + 1;
+                send_chunk_data(fd, rx, ring, cs, wb, seed);
+                chunk_count = chunk_count + 1;
+                rx = rx + 1;
+            }
+            // left and right columns (excluding corners already sent)
+            let rz: i32 = 0 - ring + 1;
+            while (rz < ring) {
+                send_chunk_data(fd, 0 - ring, rz, cs, wb, seed);
+                chunk_count = chunk_count + 1;
+                send_chunk_data(fd, ring, rz, cs, wb, seed);
+                chunk_count = chunk_count + 1;
+                rz = rz + 1;
+            }
         }
-        cx = cx + 1;
+        ring = ring + 1;
     }
 
     send_chunk_batch_finished(fd, chunk_count);
@@ -671,8 +737,9 @@ fn send_spawn_chunks(fd: i32, view_distance: i32, cs: str, wb: str, seed: i32) -
 // ---------------------------------------------------------------------------
 
 fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str, seed: i32) -> void {
-    // 1. send login (play) packet
-    send_login_play(fd, entity_id);
+    // 1. send login (play) packet with view distance from config
+    let vd: i32 = config_get_view_distance();
+    send_login_play(fd, entity_id, vd);
 
     // 2. game event: start waiting for level chunks (event 13)
     // value is the wait percentage as float bits... 0 means start
@@ -685,7 +752,7 @@ fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str, seed: i32) -> void
     send_spawn_position(fd, 0, spawn_y, 0);
 
     // 4. send chunks around spawn
-    send_spawn_chunks(fd, 3, cs, wb, seed);
+    send_spawn_chunks(fd, vd, cs, wb, seed);
 
     // 5. teleport player to spawn (on top of the terrain)
     send_player_position(fd, 0, spawn_y + 1, 0, 1);
@@ -696,7 +763,7 @@ fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str, seed: i32) -> void
 // returns false if the client disconnected
 // ---------------------------------------------------------------------------
 
-fn handle_play_packet(fd: i32, cs: str, world_seed: i32) -> bool {
+fn handle_play_packet(fd: i32, cs: str, world_seed: i32, inv: str) -> bool {
     let ready: i32 = net_poll_read(fd, 100);
     if (ready < 0) { return false; }   // POLLHUP/POLLERR = disconnected
     if (ready == 0) { return true; }   // timeout, no data yet, still connected
@@ -764,10 +831,18 @@ fn handle_play_packet(fd: i32, cs: str, world_seed: i32) -> bool {
         // this is block breaking, eating, shield etc
         // format: VarInt status, Position location, VarInt face, VarInt sequence
         handle_player_action(fd, buf, id_size, pkt_len, cs, world_seed);
+    } else if (packet_id == 52) {
+        // 0x34 - Set Held Item (set_carried_item)
+        // player changed which hotbar slot is selected
+        handle_set_held_item(buf, id_size, pkt_len, inv);
+    } else if (packet_id == 55) {
+        // 0x37 - Set Creative Mode Slot (set_creative_mode_slot)
+        // player put an item into their creative inventory
+        handle_set_creative_slot(buf, id_size, pkt_len, inv);
     } else if (packet_id == 63) {
         // 0x3F - Use Item On (use_item_on)
         // block placement
-        handle_use_item_on(fd, buf, id_size, pkt_len, cs, world_seed);
+        handle_use_item_on(fd, buf, id_size, pkt_len, cs, world_seed, inv);
     }
 
     return true;
@@ -935,6 +1010,76 @@ fn handle_player_action(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, 
 }
 
 // ---------------------------------------------------------------------------
+// handle Set Held Item packet (0x34 / id 52)
+// player switched their selected hotbar slot
+// format: i16 slot (0-8)
+// ---------------------------------------------------------------------------
+
+fn handle_set_held_item(buf: str, id_size: i32, pkt_len: i32, inv: str) -> void {
+    if (id_size + 2 > pkt_len) { return; }
+
+    // read slot as unsigned i16 (big-endian)
+    let slot: i32 = (buf[id_size] << 8) | buf[id_size + 1];
+
+    // clamp to valid range
+    if (slot < 0 || slot > 8) { return; }
+
+    // store selected slot in inv buffer bytes [0..3]
+    inv[0] = slot & 255;
+    inv[1] = (slot >> 8) & 255;
+    inv[2] = 0;
+    inv[3] = 0;
+    log_debug("held item slot changed to " + i32_to_str(slot));
+}
+
+// ---------------------------------------------------------------------------
+// handle Set Creative Mode Slot packet (0x37 / id 55)
+// player set an item in their creative inventory
+// format: i16 slot, Slot(item_count + item_id + components if count > 0)
+//
+// hotbar slots are 36-44 in the full inventory (we map to 0-8)
+// ---------------------------------------------------------------------------
+
+fn handle_set_creative_slot(buf: str, id_size: i32, pkt_len: i32, inv: str) -> void {
+    if (id_size + 2 > pkt_len) { return; }
+
+    // read slot number (i16 big-endian)
+    let slot: i32 = (buf[id_size] << 8) | buf[id_size + 1];
+    let pos: i32 = id_size + 2;
+
+    // only care about hotbar slots (36-44 in full inventory = 0-8 hotbar)
+    let hotbar_idx: i32 = slot - 36;
+    if (hotbar_idx < 0 || hotbar_idx > 8) {
+        // not a hotbar slot - ignore for now
+        return;
+    }
+
+    // read item stack: VarInt item_count
+    if (pos >= pkt_len) { return; }
+    let count_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+    let item_count: i32 = unpack_varint_value(count_packed);
+    pos = pos + unpack_varint_size(count_packed);
+
+    let item_id: i32 = -1;
+    if (item_count > 0) {
+        // read VarInt item_id
+        if (pos >= pkt_len) { return; }
+        let iid_packed: i32 = read_varint_packed(buf, pos, pkt_len);
+        item_id = unpack_varint_value(iid_packed);
+        // we dont need to read the rest (components etc)
+    }
+
+    // store item_id in the hotbar inventory buffer
+    let inv_off: i32 = 4 + hotbar_idx * 4;
+    inv[inv_off] = item_id & 255;
+    inv[inv_off + 1] = (item_id >> 8) & 255;
+    inv[inv_off + 2] = (item_id >> 16) & 255;
+    inv[inv_off + 3] = (item_id >> 24) & 255;
+
+    log_debug("creative slot " + i32_to_str(slot) + " (hotbar " + i32_to_str(hotbar_idx) + ") = item " + i32_to_str(item_id));
+}
+
+// ---------------------------------------------------------------------------
 // handle Use Item On packet (0x3F / id 63)
 // this is block placement
 // format: VarInt hand, Position location, VarInt face,
@@ -942,7 +1087,7 @@ fn handle_player_action(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, 
 //         bool inside_block, bool world_border_hit, VarInt sequence
 // ---------------------------------------------------------------------------
 
-fn handle_use_item_on(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, world_seed: i32) -> void {
+fn handle_use_item_on(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, world_seed: i32, inv: str) -> void {
     let pos: i32 = id_size;
 
     // read hand (VarInt)
@@ -988,13 +1133,26 @@ fn handle_use_item_on(fd: i32, buf: str, id_size: i32, pkt_len: i32, cs: str, wo
     else if (face == 4) { nx = bx - 1; }   // west
     else if (face == 5) { nx = bx + 1; }   // east
 
-    // place a stone block (id 1) for now - proper inventory system later
+    // look up what the player is holding and place that block
+    let sel_slot: i32 = inv[0] | (inv[1] << 8) | (inv[2] << 16) | (inv[3] << 24);
+    let slot_off: i32 = 4 + sel_slot * 4;
+    let held_item: i32 = inv[slot_off] | (inv[slot_off + 1] << 8) | (inv[slot_off + 2] << 16) | (inv[slot_off + 3] << 24);
+
+    // convert item id to block state id
+    let block_state: i32 = 1;  // default to stone if we cant figure it out
+    if (held_item >= 0) {
+        let mapped: i32 = item_to_block_state(held_item);
+        if (mapped > 0) {
+            block_state = mapped;
+        }
+    }
+
     // only place if the target position is currently air
     let current: i32 = chunk_get_block(cs, nx, ny, nz);
     if (current == 0) {
-        chunk_set_block(cs, nx, ny, nz, 1);
-        send_block_update(fd, nx, ny, nz, 1);
-        log_debug("block placed");
+        chunk_set_block(cs, nx, ny, nz, block_state);
+        send_block_update(fd, nx, ny, nz, block_state);
+        log_debug("block placed: item=" + i32_to_str(held_item) + " state=" + i32_to_str(block_state));
     }
     send_block_changed_ack(fd, sequence);
 }

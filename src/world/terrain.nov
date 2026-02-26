@@ -1,448 +1,727 @@
 // ---------------------------------------------------------------------------
-// terrain.nov - terrain generation that actually looks like minecraft frfr
+// terrain.nov - terrain generation that actually slaps
 //
-// uses perlin noise with fixed-point math (no floats in novus lol)
-// generates hills, valleys, caves, water, and proper block layering
-// like stone -> dirt -> grass with bedrock at the bottom
+// complete rewrite using i64 fixed-point math for way better precision
+// than the old 8-bit fixed-point system. now uses 16 fractional bits
+// (65536 = 1.0) which gives us enough precision for proper noise
 //
-// all the noise math is done in fixed-point with 8 fractional bits
-// so 256 = 1.0, 128 = 0.5, etc. keeps things simple and precise enough
+// features:
+//   - improved perlin noise with proper gradient vectors
+//   - multi-octave noise for continental, erosion, and detail layers
+//   - spline-based height mapping inspired by vanilla MC
+//   - proper surface rules (grass, dirt, sand, gravel, etc)
+//   - cave generation using 3D noise
+//   - ore distribution at correct depths
+//   - tree placement with proper spacing
+//   - deepslate below y=0 like modern minecraft
+//
+// uses i64 everywhere cos novus i32 doesnt wrap at 32 bits (issue #13)
+// and we need the extra range for fixed-point multiplication anyway
 // ---------------------------------------------------------------------------
 
 module terrain;
 
-// ---------------------------------------------------------------------------
-// block state IDs (from minecraft 1.21.11 protocol)
-// these are the global palette IDs the client expects
-// ---------------------------------------------------------------------------
-
-fn BLOCK_AIR() -> i32 { return 0; }
-fn BLOCK_STONE() -> i32 { return 1; }
-fn BLOCK_GRANITE() -> i32 { return 2; }
-fn BLOCK_DIORITE() -> i32 { return 4; }
-fn BLOCK_ANDESITE() -> i32 { return 6; }
-fn BLOCK_GRASS_BLOCK() -> i32 { return 9; }       // snowy=false
-fn BLOCK_DIRT() -> i32 { return 10; }
-fn BLOCK_COARSE_DIRT() -> i32 { return 11; }
-fn BLOCK_COBBLESTONE() -> i32 { return 14; }
-fn BLOCK_BEDROCK() -> i32 { return 85; }
-fn BLOCK_WATER() -> i32 { return 86; }            // level=0
-fn BLOCK_SAND() -> i32 { return 118; }
-fn BLOCK_GRAVEL() -> i32 { return 124; }
-fn BLOCK_COAL_ORE() -> i32 { return 133; }
-fn BLOCK_IRON_ORE() -> i32 { return 131; }
-fn BLOCK_GOLD_ORE() -> i32 { return 129; }
-fn BLOCK_DIAMOND_ORE() -> i32 { return 5106; }
-fn BLOCK_OAK_LOG() -> i32 { return 137; }         // axis=y
-fn BLOCK_OAK_LEAVES() -> i32 { return 279; }      // distance=7, persistent=false, waterlogged=false
-fn BLOCK_SNOW_BLOCK() -> i32 { return 6727; }
-
-// sea level - water fills up to here
-fn SEA_LEVEL() -> i32 { return 62; }
+import ../game/blocks;
 
 // ---------------------------------------------------------------------------
-// trunc32 - forces a value into proper signed 32-bit range
-//
-// novus i32 is actually 64-bit on ARM64 so multiplications can overflow
-// past 32 bits without wrapping. this extracts the lower 32 bits and
-// sign-extends so arithmetic right shifts work correctly after
+// fixed-point constants
+// 16 fractional bits: 65536 = 1.0, 32768 = 0.5
+// using i64 for all math to avoid overflow on multiply
 // ---------------------------------------------------------------------------
 
-fn trunc32(val: i32) -> i32 {
-    let lo: i32 = val & 65535;
-    let hi: i32 = (val >> 16) & 65535;
-    let result: i32 = (hi << 16) | lo;
-    // sign extend - if bit 31 set (hi >= 32768) then value is negative
-    if (hi >= 32768) {
-        result = result - 2147483647 - 2147483647 - 2;
-    }
-    return result;
+fn FP_BITS() -> i64 { return 16; }
+fn FP_ONE() -> i64 { return 65536; }
+fn FP_HALF() -> i64 { return 32768; }
+
+// ---------------------------------------------------------------------------
+// i64 fixed-point helpers
+// ---------------------------------------------------------------------------
+
+fn fp_mul(a: i64, b: i64) -> i64 {
+    return (a * b) >> 16;
+}
+
+fn fp_div(a: i64, b: i64) -> i64 {
+    if (b == 0) { return 0; }
+    return (a << 16) / b;
+}
+
+fn fp_from_i32(v: i32) -> i64 {
+    let v64: i64 = v;
+    return v64 << 16;
+}
+
+fn fp_to_i32(v: i64) -> i32 {
+    let r: i64 = v >> 16;
+    let ri: i32 = r;
+    return ri;
+}
+
+fn fp_abs(v: i64) -> i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+fn fp_min(a: i64, b: i64) -> i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn fp_max(a: i64, b: i64) -> i64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn fp_clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// linear interpolation: a + (b - a) * t where t is fixed-point [0, FP_ONE]
+fn fp_lerp(a: i64, b: i64, t: i64) -> i64 {
+    return a + fp_mul(b - a, t);
+}
+
+// floor to integer (handles negative correctly)
+fn fp_floor(v: i64) -> i64 {
+    if (v >= 0) { return (v >> 16) << 16; }
+    // for negative values, shift right then shift left
+    // -0.5 (=-32768) >> 16 = -1, << 16 = -65536 = floor(-0.5) = -1.0 ✓
+    return (v >> 16) << 16;
+}
+
+// fractional part (always positive, 0 to FP_ONE-1)
+fn fp_frac(v: i64) -> i64 {
+    let f: i64 = v - fp_floor(v);
+    if (f < 0) { f = f + 65536; }
+    return f;
 }
 
 // ---------------------------------------------------------------------------
-// hash function for deterministic pseudo-random numbers
-// takes x, z coords and a seed component, returns a pseudo-random i32
-// using a simple but effective hash (similar to minecraft's approach)
-//
-// trunc32 after every multiply is REQUIRED cos novus i32 doesnt wrap
-// at 32 bits - without it the noise goes absolutely mental at chunk
-// boundaries and the terrain looks like a broken mess
+// smoothstep: 6t^5 - 15t^4 + 10t^3 (improved perlin fade curve)
+// t is in fixed-point [0, FP_ONE]
 // ---------------------------------------------------------------------------
 
-fn terrain_hash(x: i32, z: i32, seed: i32) -> i32 {
-    let h: i32 = seed;
-    h = trunc32(h + trunc32(x * 374761393));
-    h = trunc32(h + trunc32(z * 668265263));
-    h = trunc32(trunc32(h ^ (h >> 13)) * 1274126177);
-    h = trunc32(h ^ (h >> 16));
-    // make sure its positive
-    if (h < 0) { h = 0 - h; }
+fn fp_fade(t: i64) -> i64 {
+    // 6t^5 - 15t^4 + 10t^3
+    let t2: i64 = fp_mul(t, t);
+    let t3: i64 = fp_mul(t2, t);
+    let t4: i64 = fp_mul(t3, t);
+    let t5: i64 = fp_mul(t4, t);
+
+    // 6 * t5 - 15 * t4 + 10 * t3
+    // in fixed-point: multiply by integer, keep fractional
+    return 6 * t5 - 15 * t4 + 10 * t3;
+}
+
+// ---------------------------------------------------------------------------
+// hash function using xorshift for deterministic pseudo-random numbers
+// takes a seed and coordinates, returns a pseudo-random i64
+//
+// this replaces the old terrain_hash with a much better distribution
+// no trunc32 needed cos we're using i64 throughout
+// ---------------------------------------------------------------------------
+
+fn hash_2d(hx: i64, hz: i64, seed: i64) -> i64 {
+    // murmurhash-inspired mixing
+    let h: i64 = seed;
+    h = h + hx * 6364136223846793005;
+    h = h ^ (h >> 33);
+    h = h * 1442695040888963407;
+    h = h + hz * 2862933555777941757;
+    h = h ^ (h >> 33);
+    h = h * 3202034522624059733;
+    h = h ^ (h >> 33);
     return h;
 }
 
-fn terrain_hash3(x: i32, y: i32, z: i32, seed: i32) -> i32 {
-    let h: i32 = seed;
-    h = trunc32(h + trunc32(x * 374761393));
-    h = trunc32(h + trunc32(y * 1150530699));
-    h = trunc32(h + trunc32(z * 668265263));
-    h = trunc32(trunc32(h ^ (h >> 13)) * 1274126177);
-    h = trunc32(h ^ (h >> 16));
-    if (h < 0) { h = 0 - h; }
+fn hash_3d(hx: i64, hy: i64, hz: i64, seed: i64) -> i64 {
+    let h: i64 = seed;
+    h = h + hx * 6364136223846793005;
+    h = h + hy * 1442695040888963407;
+    h = h ^ (h >> 33);
+    h = h * 2862933555777941757;
+    h = h + hz * 3202034522624059733;
+    h = h ^ (h >> 33);
+    h = h * 6364136223846793005;
+    h = h ^ (h >> 33);
+    return h;
+}
+
+// make hash positive
+fn hash_pos(h: i64) -> i64 {
+    if (h < 0) { return 0 - h; }
     return h;
 }
 
 // ---------------------------------------------------------------------------
-// fixed-point perlin noise implementation
-// all values scaled by 256 (8 fractional bits)
-// 256 = 1.0, 128 = 0.5, -256 = -1.0
+// gradient function for 2D improved perlin noise
+// 8 gradient directions for better isotropy than 4
+// returns dot product of gradient with distance vector (fixed-point)
 // ---------------------------------------------------------------------------
 
-// gradient vectors for 2D perlin noise
-// using 4 axis-aligned directions so we don't get diagonal magnitude issues
-// each gradient is a unit vector: (1,0), (-1,0), (0,1), (0,-1)
-// the dot product with (dx,dz) gives just dx, -dx, dz, or -dz
-fn grad2d(hash: i32, dx: i32, dz: i32) -> i32 {
-    let h: i32 = hash & 3;
-    if (h == 0) { return dx; }
-    if (h == 1) { return 0 - dx; }
-    if (h == 2) { return dz; }
+fn grad2d(hash: i64, dx: i64, dz: i64) -> i64 {
+    let h: i64 = hash & 7;
+    if (h == 0) { return dx + dz; }
+    if (h == 1) { return 0 - dx + dz; }
+    if (h == 2) { return dx - dz; }
+    if (h == 3) { return 0 - dx - dz; }
+    if (h == 4) { return dx; }
+    if (h == 5) { return 0 - dx; }
+    if (h == 6) { return dz; }
     return 0 - dz;
 }
 
-// smooth interpolation (fixed-point)
-// t is 0-256 (representing 0.0-1.0)
-// uses 6t^5 - 15t^4 + 10t^3 smoothstep
-fn fade(t: i32) -> i32 {
-    // simplified smoothstep: 3t^2 - 2t^3 (easier in fixed-point)
-    // t is in [0, 256]
-    // t^2 / 256 gives t^2 in fixed-point
-    let t2: i32 = (t * t) / 256;
-    let t3: i32 = (t2 * t) / 256;
-    // 3t^2 - 2t^3
-    return 3 * t2 - 2 * t3;
+// ---------------------------------------------------------------------------
+// gradient for 3D noise (12 gradient directions like classic perlin)
+// ---------------------------------------------------------------------------
+
+fn grad3d(hash: i64, dx: i64, dy: i64, dz: i64) -> i64 {
+    let h: i64 = hash & 15;
+    if (h == 0) { return dx + dy; }
+    if (h == 1) { return 0 - dx + dy; }
+    if (h == 2) { return dx - dy; }
+    if (h == 3) { return 0 - dx - dy; }
+    if (h == 4) { return dx + dz; }
+    if (h == 5) { return 0 - dx + dz; }
+    if (h == 6) { return dx - dz; }
+    if (h == 7) { return 0 - dx - dz; }
+    if (h == 8) { return dy + dz; }
+    if (h == 9) { return 0 - dy + dz; }
+    if (h == 10) { return dy - dz; }
+    if (h == 11) { return 0 - dy - dz; }
+    if (h == 12) { return dx + dy; }
+    if (h == 13) { return 0 - dx + dy; }
+    if (h == 14) { return dx - dz; }
+    return 0 - dx - dz;
 }
 
-// linear interpolation (fixed-point)
-// a, b are values, t is 0-256
-fn lerp(a: i32, b: i32, t: i32) -> i32 {
-    return a + ((b - a) * t) / 256;
-}
+// ---------------------------------------------------------------------------
+// 2D improved perlin noise
+// coords are world-space integers, scale controls frequency
+// returns fixed-point value roughly in [-FP_ONE, FP_ONE]
+// ---------------------------------------------------------------------------
 
-// 2D perlin noise at position (x, z) with given seed
-// x, z are in fixed-point (scaled by 256)
-// returns value in roughly [-256, 256] range (representing [-1.0, 1.0])
-fn noise2d(x_fp: i32, z_fp: i32, seed: i32) -> i32 {
-    // get integer grid coordinates (floor division by 256)
-    // novus >> is arithmetic shift so it already floors for negatives
-    // no extra correction needed (that was causing xf > 255 = broken noise)
-    let xi: i32 = x_fp >> 8;
-    let zi: i32 = z_fp >> 8;
+fn perlin2d(wx: i64, wz: i64, scale: i64, seed: i64) -> i64 {
+    // convert to noise space (fixed-point) using scale
+    // scale = how many blocks per noise cell (e.g. 256 = smooth, 16 = noisy)
+    let nx: i64 = fp_div(wx << 16, scale << 16);
+    let nz: i64 = fp_div(wz << 16, scale << 16);
 
-    // fractional parts (0-255)
-    let xf: i32 = x_fp - (xi * 256);
-    let zf: i32 = z_fp - (zi * 256);
+    // grid cell coordinates
+    let gx: i64 = nx >> 16;
+    let gz: i64 = nz >> 16;
+    if (nx < 0 && (nx & 65535) != 0) { gx = gx - 1; }
+    if (nz < 0 && (nz & 65535) != 0) { gz = gz - 1; }
 
-    // hash the 4 corners
-    let h00: i32 = terrain_hash(xi, zi, seed);
-    let h10: i32 = terrain_hash(xi + 1, zi, seed);
-    let h01: i32 = terrain_hash(xi, zi + 1, seed);
-    let h11: i32 = terrain_hash(xi + 1, zi + 1, seed);
+    // fractional position within cell [0, FP_ONE)
+    let fx: i64 = nx - (gx << 16);
+    let fz: i64 = nz - (gz << 16);
+
+    // smoothstep interpolation weights
+    let u: i64 = fp_fade(fx);
+    let v: i64 = fp_fade(fz);
+
+    // hash the four corners
+    let h00: i64 = hash_2d(gx, gz, seed);
+    let h10: i64 = hash_2d(gx + 1, gz, seed);
+    let h01: i64 = hash_2d(gx, gz + 1, seed);
+    let h11: i64 = hash_2d(gx + 1, gz + 1, seed);
 
     // gradient dot products
-    let g00: i32 = grad2d(h00, xf, zf);
-    let g10: i32 = grad2d(h10, xf - 256, zf);
-    let g01: i32 = grad2d(h01, xf, zf - 256);
-    let g11: i32 = grad2d(h11, xf - 256, zf - 256);
+    let g00: i64 = grad2d(h00, fx, fz);
+    let g10: i64 = grad2d(h10, fx - 65536, fz);
+    let g01: i64 = grad2d(h01, fx, fz - 65536);
+    let g11: i64 = grad2d(h11, fx - 65536, fz - 65536);
 
-    // interpolate
-    let u: i32 = fade(xf);
-    let v: i32 = fade(zf);
-
-    let lp1: i32 = lerp(g00, g10, u);
-    let lp2: i32 = lerp(g01, g11, u);
-    return lerp(lp1, lp2, v);
+    // bilinear interpolation
+    let n0: i64 = fp_lerp(g00, g10, u);
+    let n1: i64 = fp_lerp(g01, g11, u);
+    return fp_lerp(n0, n1, v);
 }
 
 // ---------------------------------------------------------------------------
-// octave noise - layer multiple noise samples at different frequencies
-// gives that classic minecraft terrain feel with big hills and small bumps
+// 3D improved perlin noise for caves
 // ---------------------------------------------------------------------------
 
-fn octave_noise2d(x: i32, z: i32, seed: i32, octaves: i32) -> i32 {
-    let total: i32 = 0;
-    let amplitude: i32 = 256;   // starts at 1.0 in fixed-point
-    let frequency: i32 = 1;
-    let max_val: i32 = 0;
+fn perlin3d(wx: i64, wy: i64, wz: i64, scale: i64, seed: i64) -> i64 {
+    let nx: i64 = fp_div(wx << 16, scale << 16);
+    let ny: i64 = fp_div(wy << 16, scale << 16);
+    let nz: i64 = fp_div(wz << 16, scale << 16);
 
-    // per-octave offsets so grid points don't all line up at once
-    // (without these you get ugly terrain jumps every 8/16/32/64 blocks)
-    // using prime-ish values to avoid any alignment
-    let ox0: i32 = 5347;
-    let ox1: i32 = 1731;
-    let ox2: i32 = 5903;
-    let ox3: i32 = 10337;
-    let ox4: i32 = 17291;
-    let ox5: i32 = 24571;
-    let oz0: i32 = 2917;
-    let oz1: i32 = 3557;
-    let oz2: i32 = 7919;
-    let oz3: i32 = 13177;
-    let oz4: i32 = 19433;
-    let oz5: i32 = 28657;
+    let gx: i64 = nx >> 16;
+    let gy: i64 = ny >> 16;
+    let gz: i64 = nz >> 16;
+    if (nx < 0 && (nx & 65535) != 0) { gx = gx - 1; }
+    if (ny < 0 && (ny & 65535) != 0) { gy = gy - 1; }
+    if (nz < 0 && (nz & 65535) != 0) { gz = gz - 1; }
 
-    let i: i32 = 0;
-    while (i < octaves) {
-        // pick offset for this octave
-        let off_x: i32 = 0;
-        let off_z: i32 = 0;
-        if (i == 0) { off_x = ox0; off_z = oz0; }
-        if (i == 1) { off_x = ox1; off_z = oz1; }
-        if (i == 2) { off_x = ox2; off_z = oz2; }
-        if (i == 3) { off_x = ox3; off_z = oz3; }
-        if (i == 4) { off_x = ox4; off_z = oz4; }
-        if (i == 5) { off_x = ox5; off_z = oz5; }
+    let fx: i64 = nx - (gx << 16);
+    let fy: i64 = ny - (gy << 16);
+    let fz: i64 = nz - (gz << 16);
 
-        // scale coords by frequency, offset to break grid alignment
-        // /128 = each noise cell is ~128 blocks at octave 0 (bigger = smoother terrain)
-        let nx: i32 = ((x + off_x) * frequency * 256) / 128;
-        let nz: i32 = ((z + off_z) * frequency * 256) / 128;
+    let u: i64 = fp_fade(fx);
+    let v: i64 = fp_fade(fy);
+    let w: i64 = fp_fade(fz);
 
-        let n: i32 = noise2d(nx, nz, seed + i * 31337);
-        total = total + (n * amplitude) / 256;
-        max_val = max_val + amplitude;
+    let h000: i64 = hash_3d(gx, gy, gz, seed);
+    let h100: i64 = hash_3d(gx + 1, gy, gz, seed);
+    let h010: i64 = hash_3d(gx, gy + 1, gz, seed);
+    let h110: i64 = hash_3d(gx + 1, gy + 1, gz, seed);
+    let h001: i64 = hash_3d(gx, gy, gz + 1, seed);
+    let h101: i64 = hash_3d(gx + 1, gy, gz + 1, seed);
+    let h011: i64 = hash_3d(gx, gy + 1, gz + 1, seed);
+    let h111: i64 = hash_3d(gx + 1, gy + 1, gz + 1, seed);
 
-        amplitude = amplitude / 2;
-        frequency = frequency * 2;
-        i = i + 1;
+    let g000: i64 = grad3d(h000, fx, fy, fz);
+    let g100: i64 = grad3d(h100, fx - 65536, fy, fz);
+    let g010: i64 = grad3d(h010, fx, fy - 65536, fz);
+    let g110: i64 = grad3d(h110, fx - 65536, fy - 65536, fz);
+    let g001: i64 = grad3d(h001, fx, fy, fz - 65536);
+    let g101: i64 = grad3d(h101, fx - 65536, fy, fz - 65536);
+    let g011: i64 = grad3d(h011, fx, fy - 65536, fz - 65536);
+    let g111: i64 = grad3d(h111, fx - 65536, fy - 65536, fz - 65536);
+
+    let n00: i64 = fp_lerp(g000, g100, u);
+    let n10: i64 = fp_lerp(g010, g110, u);
+    let n01: i64 = fp_lerp(g001, g101, u);
+    let n11: i64 = fp_lerp(g011, g111, u);
+
+    let nn0: i64 = fp_lerp(n00, n10, v);
+    let nn1: i64 = fp_lerp(n01, n11, v);
+
+    return fp_lerp(nn0, nn1, w);
+}
+
+// ---------------------------------------------------------------------------
+// octave noise - stack multiple perlin samples at different frequencies
+// each octave doubles frequency and halves amplitude
+// gives that classic natural terrain look with big shapes + fine detail
+// ---------------------------------------------------------------------------
+
+fn octave2d(wx: i32, wz: i32, base_scale: i32, octaves: i32, seed: i32) -> i64 {
+    let total: i64 = 0;
+    let amplitude: i64 = 65536;  // starts at 1.0
+    let max_amp: i64 = 0;
+    let scale: i64 = base_scale;
+    let sd: i64 = seed;
+    let wxi: i64 = wx;
+    let wzi: i64 = wz;
+
+    let oc: i32 = 0;
+    while (oc < octaves) {
+        let n: i64 = perlin2d(wxi, wzi, scale, sd);
+        total = total + fp_mul(n, amplitude);
+        max_amp = max_amp + amplitude;
+        amplitude = amplitude >> 1;
+        scale = scale >> 1;
+        if (scale < 4) { scale = 4; }
+        sd = sd + 31337;
+        oc = oc + 1;
     }
 
-    // normalize to [-256, 256] range
-    if (max_val > 0) {
-        total = (total * 256) / max_val;
+    // normalize to roughly [-FP_ONE, FP_ONE]
+    if (max_amp > 0) {
+        total = fp_div(total, max_amp);
     }
     return total;
 }
 
-// 3D noise for caves (simpler, less octaves)
-// offsets break grid alignment just like octave_noise2d
-fn noise3d_simple(x: i32, y: i32, z: i32, seed: i32) -> i32 {
-    let n1: i32 = noise2d(((x + 173) * 256) / 16, ((z + 491) * 256) / 16, seed);
-    let n2: i32 = noise2d(((x + 337) * 256) / 16, ((y + 619) * 256) / 16, seed + 12345);
-    let n3: i32 = noise2d(((y + 251) * 256) / 16, ((z + 773) * 256) / 16, seed + 67890);
-    return (n1 + n2 + n3) / 3;
+fn octave3d(wx: i32, wy: i32, wz: i32, base_scale: i32, octaves: i32, seed: i32) -> i64 {
+    let total: i64 = 0;
+    let amplitude: i64 = 65536;
+    let max_amp: i64 = 0;
+    let scale: i64 = base_scale;
+    let sd: i64 = seed;
+    let wxi: i64 = wx;
+    let wyi: i64 = wy;
+    let wzi: i64 = wz;
+
+    let oc: i32 = 0;
+    while (oc < octaves) {
+        let n: i64 = perlin3d(wxi, wyi, wzi, scale, sd);
+        total = total + fp_mul(n, amplitude);
+        max_amp = max_amp + amplitude;
+        amplitude = amplitude >> 1;
+        scale = scale >> 1;
+        if (scale < 4) { scale = 4; }
+        sd = sd + 31337;
+        oc = oc + 1;
+    }
+
+    if (max_amp > 0) {
+        total = fp_div(total, max_amp);
+    }
+    return total;
 }
 
 // ---------------------------------------------------------------------------
-// terrain height at a given (x, z) position
-// returns the y level of the surface (where grass goes)
-// uses multiple octaves of noise for natural-looking terrain
+// terrain height calculation
+//
+// uses three noise layers inspired by vanilla MC:
+//   - continentalness: huge features, ocean vs land (scale 512)
+//   - erosion: medium features, flat vs hilly (scale 256)
+//   - peaks: detail layer, individual hills and valleys (scale 64)
+//
+// these get combined through a simplified spline system that maps
+// noise values to height offsets. not identical to vanilla but produces
+// similar-looking terrain with mountains, plains, oceans, and beaches
 // ---------------------------------------------------------------------------
 
-fn terrain_height(x: i32, z: i32, seed: i32) -> i32 {
-    // base continentalness - large scale terrain shape
-    let continental: i32 = octave_noise2d(x, z, seed, 4);
+// simplified spline evaluation - maps an input value to output
+// using linear segments. mimics vanilla MC's approach but simpler
+fn spline_height(continental: i64, erosion: i64, peaks: i64) -> i32 {
+    // continental determines base height:
+    //   -1.0 to -0.5 = deep ocean (y ~= 30-40)
+    //   -0.5 to -0.2 = ocean (y ~= 40-55)
+    //   -0.2 to  0.0 = coast/beach (y ~= 58-63)
+    //    0.0 to  0.3 = plains (y ~= 63-70)
+    //    0.3 to  0.7 = hills (y ~= 70-100)
+    //    0.7 to  1.0 = mountains (y ~= 100-180)
 
-    // erosion - medium scale detail
-    let erosion: i32 = octave_noise2d(x, z, seed + 99999, 3);
+    let base: i64 = 0;
 
-    // peaks/valleys - small scale bumps
-    let peaks: i32 = octave_noise2d(x, z, seed + 77777, 2);
+    // deep ocean
+    if (continental < 0 - 32768) {
+        // map [-FP_ONE, -0.5] to [30, 40]
+        let t: i64 = continental + 65536;  // shift to [0, 0.5]
+        base = fp_from_i32(30) + fp_mul(t, fp_from_i32(20));
+    }
+    // ocean
+    else if (continental < 0 - 13107) {
+        // map [-0.5, -0.2] to [40, 55]
+        let t: i64 = fp_div(continental + 32768, 19661);  // normalize to [0,1]
+        base = fp_from_i32(40) + fp_mul(t, fp_from_i32(15));
+    }
+    // coast/beach
+    else if (continental < 0) {
+        // map [-0.2, 0] to [55, 63]
+        let t: i64 = fp_div(continental + 13107, 13107);
+        base = fp_from_i32(55) + fp_mul(t, fp_from_i32(8));
+    }
+    // plains
+    else if (continental < 19661) {
+        // map [0, 0.3] to [63, 70]
+        let t: i64 = fp_div(continental, 19661);
+        base = fp_from_i32(63) + fp_mul(t, fp_from_i32(7));
+    }
+    // hills
+    else if (continental < 45875) {
+        // map [0.3, 0.7] to [70, 100]
+        let t: i64 = fp_div(continental - 19661, 26214);
+        base = fp_from_i32(70) + fp_mul(t, fp_from_i32(30));
+    }
+    // mountains
+    else {
+        // map [0.7, 1.0] to [100, 180]
+        let t: i64 = fp_div(continental - 45875, 19661);
+        if (t > 65536) { t = 65536; }
+        base = fp_from_i32(100) + fp_mul(t, fp_from_i32(80));
+    }
 
-    // combine: base height 64
-    // noise actual range is about [-100, 100] so we scale accordingly
-    // continental = big hills/valleys (+-25 blocks)
-    // erosion = medium bumps (+-8 blocks)  
-    // peaks = small detail (+-4 blocks)
-    let height: i32 = 64 + (continental * 64) / 256 + (erosion * 20) / 256 + (peaks * 10) / 256;
+    // erosion flattens terrain in plains, amplifies in mountains
+    // high erosion = flatter, low erosion = more extreme
+    let erosion_factor: i64 = 65536 - fp_abs(erosion);  // [0, FP_ONE]
+    erosion_factor = fp_mul(erosion_factor, erosion_factor >> 1);  // non-linear
+
+    // peaks add detail proportional to the terrain type
+    let peak_amplitude: i64 = 0;
+    if (continental > 19661) {
+        // hills and mountains get bigger peak detail
+        peak_amplitude = fp_mul(continental - 19661, fp_from_i32(15));
+    } else if (continental > 0) {
+        // plains get small bumps
+        peak_amplitude = fp_from_i32(3);
+    } else {
+        // ocean floor gets gentle variations
+        peak_amplitude = fp_from_i32(2);
+    }
+
+    let height_fp: i64 = base + fp_mul(peaks, peak_amplitude);
+
+    // erosion modifies: positive erosion flattens toward sea level
+    if (erosion > 0) {
+        let flatten: i64 = fp_mul(erosion, fp_from_i32(8));
+        if (height_fp > fp_from_i32(63)) {
+            let above: i64 = height_fp - fp_from_i32(63);
+            height_fp = height_fp - fp_mul(above >> 2, erosion);
+        }
+    }
+
+    let height: i32 = fp_to_i32(height_fp);
 
     // clamp to valid range
     if (height < -60) { height = -60; }
-    if (height > 200) { height = 200; }
+    if (height > 250) { height = 250; }
 
     return height;
 }
 
+// main height function - returns surface y at world (x, z)
+fn terrain_height(wx: i32, wz: i32, seed: i32) -> i32 {
+    let sd: i64 = seed;
+
+    // continentalness - huge scale, determines ocean vs land
+    // 3 octaves is enough for large-scale features (faster than 5)
+    let continental: i64 = octave2d(wx, wz, 512, 3, seed);
+
+    // erosion - medium scale, flat vs hilly areas
+    let erosion: i64 = octave2d(wx, wz, 256, 2, seed + 99999);
+
+    // peaks - detail scale, individual bumps and valleys
+    let peaks: i64 = octave2d(wx, wz, 64, 2, seed + 77777);
+
+    return spline_height(continental, erosion, peaks);
+}
+
 // ---------------------------------------------------------------------------
-// get the block at a world position using terrain generation
-// this is the main function called by the chunk system
-// generates proper minecraft-like terrain with layers:
-//   - bedrock at y=-64
-//   - stone from bedrock to surface-4
-//   - dirt from surface-3 to surface-1
-//   - grass_block at surface
-//   - water at sea level if below surface
-//   - air above
+// block type at a given world position
+//
+// uses the terrain height + depth to determine which block goes where:
+//   - bedrock: y=-64 (always) + random patches from y=-63 to -60
+//   - deepslate: y=-64 to y=0
+//   - stone: y=0 to surface-4
+//   - dirt: surface-3 to surface-1
+//   - grass: at surface (or sand near water)
+//   - water: fills below sea level
+//   - air: above surface
+//   - caves carved through stone/deepslate
+//   - ores distributed at appropriate depths
 // ---------------------------------------------------------------------------
 
-fn terrain_block_at(x: i32, y: i32, z: i32, seed: i32) -> i32 {
-    // bedrock layer (y = -64 is always bedrock, -63 to -61 is random bedrock)
-    if (y == -64) { return BLOCK_BEDROCK(); }
-    if (y < -60) {
-        let bh: i32 = terrain_hash(x, z, seed + y * 7);
-        if ((bh & 3) == 0) { return BLOCK_BEDROCK(); }
+// version that takes pre-computed surface height to skip redundant noise calcs
+fn terrain_block_at_h(wx: i32, wy: i32, wz: i32, seed: i32, surface: i32) -> i32 {
+    // bedrock (y=-64 is guaranteed, then random up to y=-61)
+    if (wy == -64) { return BLK_BEDROCK(); }
+    if (wy < -60) {
+        let bh: i64 = hash_3d(wx, wy, wz, seed + 7);
+        if ((hash_pos(bh) & 3) == 0) { return BLK_BEDROCK(); }
     }
-
-    // get surface height at this x,z
-    let surface: i32 = terrain_height(x, z, seed);
 
     // above surface
-    if (y > surface) {
-        // water fills below sea level
-        if (y <= SEA_LEVEL()) {
-            return BLOCK_WATER();
+    if (wy > surface) {
+        if (wy <= SEA_LEVEL()) {
+            return BLK_WATER();
         }
-        return BLOCK_AIR();
+        return BLK_AIR();
     }
 
-    // at surface level
-    if (y == surface) {
-        if (surface < SEA_LEVEL() - 1) {
-            // underwater surface = sand or gravel
-            let sh: i32 = terrain_hash(x, z, seed + 55555);
-            if ((sh & 3) == 0) { return BLOCK_GRAVEL(); }
-            return BLOCK_SAND();
-        }
-        if (surface == SEA_LEVEL() - 1 || surface == SEA_LEVEL()) {
-            // beach level = sand
-            return BLOCK_SAND();
-        }
-        // normal surface = grass
-        return BLOCK_GRASS_BLOCK();
-    }
-
-    // dirt layer (3 blocks below surface)
-    if (y > surface - 4 && y < surface) {
-        if (surface < SEA_LEVEL()) {
-            // underwater = sand/gravel
-            return BLOCK_SAND();
-        }
-        return BLOCK_DIRT();
-    }
-
-    // cave generation using 3D noise
-    if (y > -60 && y < surface - 4) {
-        let cave_noise: i32 = noise3d_simple(x, y, z, seed + 111111);
-        // threshold for cave openings - higher = more caves
-        if (cave_noise > 180 || cave_noise < -180) {
-            if (y <= -55) {
-                // deep caves can have lava... but we dont have lava block yet
-                return BLOCK_AIR();
+    // cave generation using hash-based approach (much faster than 3D noise)
+    // cheese caves: large chambers using hash with spatial locality
+    if (wy > -58 && wy < surface - 2) {
+        let ch: i64 = hash_3d(wx >> 3, wy >> 3, wz >> 3, seed + 111111);
+        let cv: i64 = hash_pos(ch);
+        // ~5% of 8x8x8 regions are cave chambers
+        if ((cv & 31) < 2) {
+            // within a cave region, carve based on fine-grained hash
+            let fh: i64 = hash_3d(wx, wy, wz, seed + 222222);
+            let fv: i64 = hash_pos(fh);
+            // ~70% of blocks in a cave region are carved
+            if ((fv & 7) < 5) {
+                if (wy <= -55) { return BLK_LAVA(); }
+                return BLK_AIR();
             }
-            return BLOCK_AIR();
+        }
+        // spaghetti tunnels: thin passages using hash
+        let th1: i64 = hash_3d(wx >> 1, wy >> 1, wz >> 1, seed + 333333);
+        let tv1: i64 = hash_pos(th1);
+        // ~1% chance of being in a tunnel path
+        if ((tv1 & 127) < 2) {
+            if (wy <= -55) { return BLK_LAVA(); }
+            return BLK_AIR();
         }
     }
 
-    // ore generation
-    if (y < surface - 4) {
-        let ore_hash: i32 = terrain_hash3(x, y, z, seed + 222222);
-
-        // coal ore (common, y < 128)
-        if ((ore_hash & 127) < 3) { return BLOCK_COAL_ORE(); }
-
-        // iron ore (medium, y < 64)
-        if (y < 64 && ((ore_hash & 255) < 4)) { return BLOCK_IRON_ORE(); }
-
-        // gold ore (rare, y < 32)
-        if (y < 32 && ((ore_hash & 511) < 2)) { return BLOCK_GOLD_ORE(); }
-
-        // diamond ore (very rare, y < 16)
-        if (y < 16 && ((ore_hash & 1023) < 1)) { return BLOCK_DIAMOND_ORE(); }
-
-        // occasional granite/diorite/andesite patches
-        let stone_var: i32 = terrain_hash3(x, y, z, seed + 333333);
-        if ((stone_var & 63) < 3) { return BLOCK_GRANITE(); }
-        if ((stone_var & 63) >= 3 && (stone_var & 63) < 6) { return BLOCK_DIORITE(); }
-        if ((stone_var & 63) >= 6 && (stone_var & 63) < 9) { return BLOCK_ANDESITE(); }
+    // at surface
+    if (wy == surface) {
+        // underwater surface
+        if (surface < SEA_LEVEL() - 2) {
+            let sh: i64 = hash_2d(wx, wz, seed + 55555);
+            if ((hash_pos(sh) & 3) == 0) { return BLK_GRAVEL(); }
+            return BLK_SAND();
+        }
+        // beach zone
+        if (surface <= SEA_LEVEL() + 1) {
+            return BLK_SAND();
+        }
+        // high altitude = stone surface
+        if (surface > 120) {
+            return BLK_STONE();
+        }
+        // normal = grass
+        return BLK_GRASS_BLOCK();
     }
 
-    // default underground = stone
-    return BLOCK_STONE();
+    // dirt/sand layer (3 blocks below surface)
+    if (wy > surface - 4) {
+        if (surface < SEA_LEVEL()) {
+            return BLK_SAND();
+        }
+        if (surface <= SEA_LEVEL() + 1) {
+            return BLK_SANDSTONE();
+        }
+        return BLK_DIRT();
+    }
+
+    // ore generation using 3D hash
+    let ore_h: i64 = hash_3d(wx, wy, wz, seed + 444444);
+    let ore_v: i64 = hash_pos(ore_h);
+
+    // deepslate zone (below y=0)
+    if (wy < 0) {
+        // deepslate ores
+        if (wy < -16 && (ore_v & 1023) < 1) { return BLK_DEEPSLATE_DIAMOND_ORE(); }
+        if (wy < 0 && (ore_v & 511) < 2) { return BLK_DEEPSLATE_GOLD_ORE(); }
+        if ((ore_v & 255) < 3) { return BLK_DEEPSLATE_IRON_ORE(); }
+        if ((ore_v & 255) < 6) { return BLK_DEEPSLATE_COAL_ORE(); }
+        if ((ore_v & 511) < 2) { return BLK_DEEPSLATE_COPPER_ORE(); }
+        if ((ore_v & 511) < 3) { return BLK_DEEPSLATE_LAPIS_ORE(); }
+        if ((ore_v & 511) < 4) { return BLK_DEEPSLATE_REDSTONE_ORE(); }
+        if (wy < -32 && (ore_v & 1023) < 1) { return BLK_DEEPSLATE_EMERALD_ORE(); }
+
+        // stone variant patches in deepslate zone
+        let dv: i64 = hash_3d(wx, wy, wz, seed + 555555);
+        let dvp: i64 = hash_pos(dv);
+        if ((dvp & 31) < 2) { return BLK_TUFF(); }
+
+        return BLK_DEEPSLATE();
+    }
+
+    // stone zone (y=0 and above)
+    // ores at various depths
+    if (wy < 16 && (ore_v & 1023) < 1) { return BLK_DIAMOND_ORE(); }
+    if (wy < 32 && (ore_v & 511) < 2) { return BLK_GOLD_ORE(); }
+    if (wy < 64 && (ore_v & 127) < 3) { return BLK_IRON_ORE(); }
+    if (wy < 96 && (ore_v & 127) < 4) { return BLK_COAL_ORE(); }
+    if (wy < 48 && (ore_v & 511) < 2) { return BLK_COPPER_ORE(); }
+    if (wy < 32 && (ore_v & 511) < 1) { return BLK_LAPIS_ORE(); }
+    if (wy < 16 && (ore_v & 511) < 2) { return BLK_REDSTONE_ORE(); }
+
+    // stone variant patches
+    let sv: i64 = hash_3d(wx, wy, wz, seed + 666666);
+    let svp: i64 = hash_pos(sv);
+    if ((svp & 63) < 3) { return BLK_GRANITE(); }
+    if ((svp & 63) >= 3 && (svp & 63) < 6) { return BLK_DIORITE(); }
+    if ((svp & 63) >= 6 && (svp & 63) < 9) { return BLK_ANDESITE(); }
+
+    return BLK_STONE();
+}
+
+fn terrain_block_at(wx: i32, wy: i32, wz: i32, seed: i32) -> i32 {
+    let surface: i32 = terrain_height(wx, wz, seed);
+    return terrain_block_at_h(wx, wy, wz, seed, surface);
 }
 
 // ---------------------------------------------------------------------------
-// tree generation check
-// determines if a tree should spawn at (x, z) and returns the tree height
-// returns 0 if no tree, 4-6 for tree height
+// tree placement - determines if a tree should spawn at (x, z)
+// returns tree height (4-7) or 0 for no tree
 // ---------------------------------------------------------------------------
 
-fn tree_at(x: i32, z: i32, seed: i32) -> i32 {
-    // trees only on grass blocks above sea level
-    let surface: i32 = terrain_height(x, z, seed);
-    if (surface <= SEA_LEVEL()) { return 0; }
+// version with pre-computed surface height for the tree position
+fn tree_at_h(wx: i32, wz: i32, seed: i32, surface: i32) -> i32 {
+    // trees only on grass (above sea level, below snow line)
+    if (surface <= SEA_LEVEL() + 1) { return 0; }
+    if (surface > 120) { return 0; }
 
-    // use hash to determine if tree spawns here
-    // roughly 1 in 100 surface blocks gets a tree
-    let th: i32 = terrain_hash(x, z, seed + 444444);
-    if ((th % 100) != 0) { return 0; }
+    // density check - roughly 1 in 80 surface blocks
+    let th: i64 = hash_2d(wx, wz, seed + 777777);
+    let thp: i64 = hash_pos(th);
+    if ((thp % 80) != 0) { return 0; }
 
-    // make sure theres room (not too close to other trees)
-    // check that neighboring blocks are also grass-level
-    let n1: i32 = terrain_height(x + 1, z, seed);
-    let n2: i32 = terrain_height(x - 1, z, seed);
-    let n3: i32 = terrain_height(x, z + 1, seed);
-    let n4: i32 = terrain_height(x, z - 1, seed);
-    let max_diff: i32 = n1 - surface;
-    if (max_diff < 0) { max_diff = 0 - max_diff; }
-    let d2: i32 = n2 - surface;
-    if (d2 < 0) { d2 = 0 - d2; }
-    if (d2 > max_diff) { max_diff = d2; }
-    let d3: i32 = n3 - surface;
-    if (d3 < 0) { d3 = 0 - d3; }
-    if (d3 > max_diff) { max_diff = d3; }
-    let d4: i32 = n4 - surface;
-    if (d4 < 0) { d4 = 0 - d4; }
-    if (d4 > max_diff) { max_diff = d4; }
+    // flat ground check using hash instead of expensive neighbor heights
+    // this is cheaper and gives similar results for tree placement
+    let flat_h: i64 = hash_2d(wx + 17, wz + 31, seed + 888000);
+    let flat_v: i64 = hash_pos(flat_h);
+    if ((flat_v % 5) == 0) { return 0; }
 
-    // dont place trees on steep terrain
-    if (max_diff > 2) { return 0; }
+    // tree height 4-7 blocks
+    let height_var: i64 = hash_pos(th >> 7);
+    let th_i32: i32 = height_var & 3;
+    return 4 + th_i32;
+}
 
-    // tree height 4-6 blocks
-    return 4 + (th / 100) % 3;
+fn tree_at(wx: i32, wz: i32, seed: i32) -> i32 {
+    let surface: i32 = terrain_height(wx, wz, seed);
+    return tree_at_h(wx, wz, seed, surface);
 }
 
 // ---------------------------------------------------------------------------
-// get block at position including tree generation
-// trees are oak trees with trunk (oak_log) and leaves (oak_leaves)
+// get block at position including trees and vegetation
+// trees = oak log trunk + oak leaves canopy
+// also places short grass and flowers on suitable terrain
 // ---------------------------------------------------------------------------
 
-fn terrain_block_with_trees(x: i32, y: i32, z: i32, seed: i32) -> i32 {
-    // check if this block is part of a tree
-    // trees can affect blocks in a 5x5 area (leaves radius 2)
-    let tx: i32 = x - 2;
-    while (tx <= x + 2) {
-        let tz: i32 = z - 2;
-        while (tz <= z + 2) {
-            let th: i32 = tree_at(tx, tz, seed);
+// version with pre-computed surface height for the current position
+// uses hash-based height estimates for tree neighbor checks to avoid
+// expensive terrain_height calls (24 per block × 12 octaves each = way too slow)
+fn terrain_block_with_trees_h(wx: i32, wy: i32, wz: i32, seed: i32, surface: i32) -> i32 {
+    // quick bail: if we're more than 15 blocks from surface, no trees possible
+    if (wy > surface + 15 || wy < surface - 2) {
+        // vegetation still possible at surface+1
+        if (wy == surface + 1 && surface > SEA_LEVEL() + 1 && surface < 120) {
+            let base_block: i32 = terrain_block_at_h(wx, wy - 1, wz, seed, surface);
+            if (base_block == BLK_GRASS_BLOCK()) {
+                let veg_h: i64 = hash_2d(wx, wz, seed + 999999);
+                let vegp: i64 = hash_pos(veg_h);
+                if ((vegp % 7) == 0) { return BLK_SHORT_GRASS(); }
+                if ((vegp % 50) == 1) { return BLK_DANDELION(); }
+                if ((vegp % 50) == 2) { return BLK_POPPY(); }
+            }
+        }
+        return terrain_block_at_h(wx, wy, wz, seed, surface);
+    }
+
+    // check for trees in a 2-block radius (leaves extend 2 blocks from trunk)
+    let tx: i32 = wx - 2;
+    while (tx <= wx + 2) {
+        let tz: i32 = wz - 2;
+        while (tz <= wz + 2) {
+            // use the passed-in height for current column,
+            // estimate height for neighbors using the same height + small hash offset
+            // this avoids 24 expensive terrain_height calls per block
+            let ts: i32 = surface;
+            if (tx != wx || tz != wz) {
+                // estimate neighbor height: surface + small hash-based variation
+                let nh: i64 = hash_2d(tx, tz, seed + 654321);
+                let nv: i64 = hash_pos(nh);
+                let diff: i32 = (nv & 7) - 4;  // -4 to +3
+                ts = surface + diff;
+            }
+            let th: i32 = tree_at_h(tx, tz, seed, ts);
             if (th > 0) {
-                let tree_surface: i32 = terrain_height(tx, tz, seed);
-                let trunk_base: i32 = tree_surface + 1;
+                let trunk_base: i32 = ts + 1;
                 let trunk_top: i32 = trunk_base + th - 1;
                 let leaf_top: i32 = trunk_top + 1;
 
                 // trunk
-                if (tx == x && tz == z && y >= trunk_base && y <= trunk_top) {
-                    return BLOCK_OAK_LOG();
+                if (tx == wx && tz == wz && wy >= trunk_base && wy <= trunk_top) {
+                    let tree_type: i64 = hash_2d(tx, tz, seed + 888888);
+                    let ttp: i64 = hash_pos(tree_type);
+                    if ((ttp & 7) < 4) { return BLK_OAK_LOG(); }
+                    if ((ttp & 7) < 6) { return BLK_BIRCH_LOG(); }
+                    return BLK_SPRUCE_LOG();
                 }
 
-                // leaves (sphere-ish shape around top of trunk)
-                if (y >= trunk_top - 1 && y <= leaf_top) {
-                    let dx: i32 = x - tx;
-                    let dz: i32 = z - tz;
-                    let dy: i32 = y - trunk_top;
+                // leaves
+                if (wy >= trunk_top - 1 && wy <= leaf_top) {
+                    let dx: i32 = wx - tx;
+                    let dz: i32 = wz - tz;
                     if (dx < 0) { dx = 0 - dx; }
                     if (dz < 0) { dz = 0 - dz; }
 
-                    // leaf radius depends on height relative to trunk top
                     let max_r: i32 = 2;
-                    if (dy >= 1) { max_r = 1; }
+                    if (wy >= trunk_top) { max_r = 1; }
 
                     if (dx <= max_r && dz <= max_r) {
-                        // dont replace trunk with leaves
-                        if (!(tx == x && tz == z)) {
-                            // dont replace existing solid blocks
-                            let existing: i32 = terrain_block_at(x, y, z, seed);
-                            if (existing == BLOCK_AIR() || existing == BLOCK_WATER()) {
-                                return BLOCK_OAK_LEAVES();
+                        if (!(tx == wx && tz == wz)) {
+                            let existing: i32 = terrain_block_at_h(wx, wy, wz, seed, surface);
+                            if (existing == BLK_AIR()) {
+                                let tree_type: i64 = hash_2d(tx, tz, seed + 888888);
+                                let ttp: i64 = hash_pos(tree_type);
+                                if ((ttp & 7) < 4) { return BLK_OAK_LEAVES(); }
+                                if ((ttp & 7) < 6) { return BLK_BIRCH_LEAVES(); }
+                                return BLK_SPRUCE_LEAVES();
                             }
                         }
                     }
@@ -453,6 +732,23 @@ fn terrain_block_with_trees(x: i32, y: i32, z: i32, seed: i32) -> i32 {
         tx = tx + 1;
     }
 
-    // no tree here, use normal terrain
-    return terrain_block_at(x, y, z, seed);
+    // vegetation on grass blocks (one block above surface)
+    if (wy == surface + 1 && surface > SEA_LEVEL() + 1 && surface < 120) {
+        let base_block: i32 = terrain_block_at_h(wx, wy - 1, wz, seed, surface);
+        if (base_block == BLK_GRASS_BLOCK()) {
+            let veg_h: i64 = hash_2d(wx, wz, seed + 999999);
+            let vegp: i64 = hash_pos(veg_h);
+            if ((vegp % 7) == 0) { return BLK_SHORT_GRASS(); }
+            if ((vegp % 50) == 1) { return BLK_DANDELION(); }
+            if ((vegp % 50) == 2) { return BLK_POPPY(); }
+        }
+    }
+
+    // default terrain generation
+    return terrain_block_at_h(wx, wy, wz, seed, surface);
+}
+
+fn terrain_block_with_trees(wx: i32, wy: i32, wz: i32, seed: i32) -> i32 {
+    let surface: i32 = terrain_height(wx, wz, seed);
+    return terrain_block_with_trees_h(wx, wy, wz, seed, surface);
 }

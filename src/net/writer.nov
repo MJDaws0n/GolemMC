@@ -11,10 +11,8 @@
 
 module writer;
 
-import ../../lib/standard_lib;
-import ../../lib/standard_lib_macos_silicon;
-import ../../lib/net;
-import ../../lib/memory;
+import ../../lib/std/main;
+import ../../lib/net/main;
 import packet;
 
 // ---------------------------------------------------------------------------

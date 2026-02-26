@@ -1,0 +1,307 @@
+module test_all;
+
+import ../lib/std/main;
+import ../lib/net/main;
+import ../lib/file_io/main;
+import helper_mod;
+
+fn test_pass(name: str) -> void {
+    print("[PASS] " + name + "\n");
+}
+
+fn test_fail(name: str, expected: str, got: str) -> void {
+    print("[FAIL] " + name + " - expected: " + expected + ", got: " + got + "\n");
+}
+
+fn main() -> i32 {
+    print("=== novus compiler issue tests ===\n\n");
+
+    // ---------------------------------------------------------------
+    // ISSUE 1: overloaded functions across modules
+    // ---------------------------------------------------------------
+    print("--- issue 1: overloaded functions across modules ---\n");
+    let i32_val: i32 = 42;
+    let i64_val: i64 = 42;
+    let r1: str = overload_test(i32_val);
+    let r2: str = overload_test(i64_val);
+    if (r1 == "i32" && r2 == "i64") {
+        test_pass("overloaded fn dispatch i32 vs i64");
+    } else {
+        test_fail("overloaded fn dispatch", "i32/i64", r1 + "/" + r2);
+    }
+    let s1: str = int_to_str(i32_val);
+    let s2: str = int_to_str(i64_val);
+    if (s1 == "42" && s2 == "42") {
+        test_pass("int_to_str overload i32 and i64");
+    } else {
+        test_fail("int_to_str overload", "42/42", s1 + "/" + s2);
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 5: syscall error flags (getflag / file_exists)
+    // ---------------------------------------------------------------
+    print("\n--- issue 5: syscall error flags ---\n");
+    let exists_no: bool = file_exists("/tmp/novus_test_nonexistent_file_xyz_abc");
+    if (!exists_no) {
+        test_pass("file_exists false for missing file");
+    } else {
+        test_fail("file_exists missing file", "false", "true");
+    }
+    let exists_yes: bool = file_exists("/tmp");
+    if (exists_yes) {
+        test_pass("file_exists true for /tmp");
+    } else {
+        test_fail("file_exists /tmp", "true", "false");
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 8: null bytes in strings get corrupted
+    // ---------------------------------------------------------------
+    print("\n--- issue 8: null bytes in strings ---\n");
+    let null_buf: str = "";
+    null_buf = null_buf + "\0";
+    null_buf = null_buf + "\0";
+    null_buf = null_buf + "\0";
+    null_buf = null_buf + "\0";
+    let nb0: i32 = byte_at(null_buf, 0);
+    let nb1: i32 = byte_at(null_buf, 1);
+    let nb2: i32 = byte_at(null_buf, 2);
+    let nb3: i32 = byte_at(null_buf, 3);
+    if (nb0 == 0 && nb1 == 0 && nb2 == 0 && nb3 == 0) {
+        test_pass("null byte concat all zero");
+    } else {
+        test_fail("null byte concat", "0,0,0,0",
+            i32_to_str(nb0) + "," + i32_to_str(nb1) + "," +
+            i32_to_str(nb2) + "," + i32_to_str(nb3));
+    }
+
+    let nbuf: str = net_make_buf(16);
+    let nbuf_ok: bool = true;
+    let nbuf_bad: str = "";
+    let ni: i32 = 0;
+    while (ni < 16) {
+        let bval: i32 = byte_at(nbuf, ni);
+        if (bval != 0) {
+            nbuf_ok = false;
+            nbuf_bad = nbuf_bad + "pos" + i32_to_str(ni) + "=" + i32_to_str(bval) + " ";
+        }
+        ni = ni + 1;
+    }
+    if (nbuf_ok) {
+        test_pass("net_make_buf(16) all zeros");
+    } else {
+        test_fail("net_make_buf(16) zero init", "all zeros", nbuf_bad);
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 9: string ops corrupt other buffers
+    // ---------------------------------------------------------------
+    print("\n--- issue 9: string ops corrupt other buffers ---\n");
+    let sentinel: str = net_make_buf(32);
+    let sent_ptr: u64 = ptr(sentinel);
+    let si: i32 = 0;
+    while (si < 8) {
+        store8(sent_ptr + i32_to_u64(si), 170);
+        si = si + 1;
+    }
+    let junk: str = "hello " + i32_to_str(12345) + " world " + i32_to_str(67890) + " test";
+    let junk2: str = junk + " more " + junk + " and more";
+    let s9_ok: bool = true;
+    let s9_bad: str = "";
+    si = 0;
+    while (si < 8) {
+        let sv: i32 = byte_at(sentinel, si);
+        if (sv != 170) {
+            s9_ok = false;
+            s9_bad = s9_bad + "pos" + i32_to_str(si) + "=" + i32_to_str(sv) + " ";
+        }
+        si = si + 1;
+    }
+    if (s9_ok) {
+        test_pass("buffer survives string concat");
+    } else {
+        test_fail("buffer after string concat", "all 170", s9_bad);
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 10: bit shift sign extension
+    // ---------------------------------------------------------------
+    print("\n--- issue 10: bit shift sign extension ---\n");
+    let shift_val: i32 = 255 << 24;
+    if (shift_val == -16777216) {
+        test_pass("255 << 24 == -16777216");
+    } else {
+        test_fail("255 << 24", "-16777216", i32_to_str(shift_val));
+    }
+
+    let neg1: i32 = 255 | (255 << 8) | (255 << 16) | (255 << 24);
+    if (neg1 == -1) {
+        test_pass("0xFFFFFFFF reconstructed as -1");
+    } else {
+        test_fail("0xFFFFFFFF", "-1", i32_to_str(neg1));
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 11: net_make_buf corrupts previous allocations
+    // ---------------------------------------------------------------
+    print("\n--- issue 11: net_make_buf corrupts previous allocations ---\n");
+    let bufA: str = net_make_buf(256);
+    let ptrA: u64 = ptr(bufA);
+    let ai: i32 = 0;
+    while (ai < 256) {
+        store8(ptrA + i32_to_u64(ai), ai & 255);
+        ai = ai + 1;
+    }
+    let bufB: str = net_make_buf(512);
+    let a_ok: bool = true;
+    let a_bad: str = "";
+    ai = 0;
+    while (ai < 256) {
+        let av: i32 = byte_at(bufA, ai) & 255;
+        let ae: i32 = ai & 255;
+        if (av != ae) {
+            if (a_ok) {
+                a_bad = "pos" + i32_to_str(ai) + "=" + i32_to_str(av) + "(want " + i32_to_str(ae) + ")";
+            }
+            a_ok = false;
+        }
+        ai = ai + 1;
+    }
+    if (a_ok) {
+        test_pass("bufA survives bufB allocation (256/512 bytes)");
+    } else {
+        test_fail("bufA after bufB alloc", "intact", a_bad);
+    }
+
+    let bufC: str = net_make_buf(4096);
+    let ptrC: u64 = ptr(bufC);
+    let ci: i32 = 0;
+    while (ci < 4096) {
+        store8(ptrC + i32_to_u64(ci), (ci * 7) & 255);
+        ci = ci + 1;
+    }
+    let bufD: str = net_make_buf(8192);
+    let c_ok: bool = true;
+    let c_bad: str = "";
+    ci = 0;
+    while (ci < 4096) {
+        let cv: i32 = byte_at(bufC, ci) & 255;
+        let ce: i32 = (ci * 7) & 255;
+        if (cv != ce) {
+            if (c_ok) {
+                c_bad = "pos" + i32_to_str(ci) + "=" + i32_to_str(cv) + "(want " + i32_to_str(ce) + ")";
+            }
+            c_ok = false;
+        }
+        ci = ci + 1;
+    }
+    if (c_ok) {
+        test_pass("bufC survives bufD allocation (4KB/8KB)");
+    } else {
+        test_fail("bufC after bufD alloc", "intact", c_bad);
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 12: str_to_i32 overflow
+    // ---------------------------------------------------------------
+    print("\n--- issue 12: str_to_i32 overflow ---\n");
+    let big_str: str = "1771329710651061000";
+    let big_val: i32 = str_to_i32(big_str);
+    let big_str2: str = "9999999999";
+    let big_val2: i32 = str_to_i32(big_str2);
+    print("  str_to_i32(\"" + big_str + "\") = " + i32_to_str(big_val) + "\n");
+    print("  str_to_i32(\"" + big_str2 + "\") = " + i32_to_str(big_val2) + "\n");
+    if (big_val != big_val2) {
+        test_pass("different overflow strings give different results");
+    } else {
+        test_fail("overflow differentiation", "different values", "both " + i32_to_str(big_val));
+    }
+    let normal: i32 = str_to_i32("2147483647");
+    if (normal == 2147483647) {
+        test_pass("str_to_i32 INT32_MAX correct");
+    } else {
+        test_fail("str_to_i32 INT32_MAX", "2147483647", i32_to_str(normal));
+    }
+    let neg_str: i32 = str_to_i32("-123");
+    if (neg_str == -123) {
+        test_pass("str_to_i32 negative correct");
+    } else {
+        test_fail("str_to_i32 negative", "-123", i32_to_str(neg_str));
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 13: i32 arithmetic 32-bit truncation
+    // ---------------------------------------------------------------
+    print("\n--- issue 13: i32 arithmetic 32-bit truncation ---\n");
+    let mul_a: i32 = 100000;
+    let mul_b: i32 = 100000;
+    let mul_result: i32 = mul_a * mul_b;
+    // 100000 * 100000 = 10000000000 (overflows i32)
+    // as i32: 10000000000 mod 2^32 = 1410065408
+    print("  100000*100000 = " + i32_to_str(mul_result) + "\n");
+    if (mul_result == 1410065408) {
+        test_pass("100000*100000 truncates to 32 bits");
+    } else {
+        test_fail("100000*100000", "1410065408 (32-bit wrap)", i32_to_str(mul_result));
+    }
+
+    let hash_in: i32 = 12345;
+    let hash_mul: i32 = 374761393;
+    let hash_out: i32 = hash_in * hash_mul;
+    // 12345 * 374761393 = 4625427395385
+    // mod 2^32 = 330460089
+    print("  12345*374761393 = " + i32_to_str(hash_out) + "\n");
+    if (hash_out == 330460089) {
+        test_pass("hash multiply truncates to 32 bits");
+    } else {
+        test_fail("hash multiply", "330460089 (32-bit wrap)", i32_to_str(hash_out));
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 14: register name collision in imported module
+    // ---------------------------------------------------------------
+    print("\n--- issue 14: register name vars in imported module ---\n");
+    let reg_result: i32 = register_name_test();
+    if (reg_result == 30) {
+        test_pass("x1+x2 in imported module = 30");
+    } else {
+        test_fail("x1+x2 in imported module", "30", i32_to_str(reg_result));
+    }
+
+    // ---------------------------------------------------------------
+    // ISSUE 15: 6th+ function parameter
+    // ---------------------------------------------------------------
+    print("\n--- issue 15: 6th+ function parameter ---\n");
+    let p6: i32 = six_params(1, 2, 3, 4, 5, 6);
+    if (p6 == 21) {
+        test_pass("six_params(1..6) = 21");
+    } else {
+        test_fail("six_params", "21", i32_to_str(p6));
+    }
+    let p7: i32 = seven_params(1, 2, 3, 4, 5, 6, 7);
+    if (p7 == 28) {
+        test_pass("seven_params(1..7) = 28");
+    } else {
+        test_fail("seven_params", "28", i32_to_str(p7));
+    }
+
+    // ---------------------------------------------------------------
+    // BONUS: verify previously fixed issues still work
+    // ---------------------------------------------------------------
+    print("\n--- verifying previously fixed issues (2,3,4,6) ---\n");
+    let bw: i32 = (255 & 15) | (3 << 8);
+    if (bw == 783) {
+        test_pass("issue 6: bitwise ops (& | <<)");
+    } else {
+        test_fail("issue 6: bitwise", "783", i32_to_str(bw));
+    }
+    let bw2: i32 = 256 >> 4;
+    if (bw2 == 16) {
+        test_pass("issue 6: right shift 256>>4 = 16");
+    } else {
+        test_fail("issue 6: right shift", "16", i32_to_str(bw2));
+    }
+
+    print("\n=== tests complete ===\n");
+    return 0;
+}

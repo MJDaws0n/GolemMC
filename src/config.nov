@@ -11,10 +11,8 @@
 
 module config;
 
-import ../lib/standard_lib;
-import ../lib/standard_lib_macos_silicon;
-import ../lib/file_io;
-import ../lib/memory;
+import ../lib/std/main;
+import ../lib/file_io/main;
 
 // ---------------------------------------------------------------------------
 // read the entire config file into a string

@@ -18,14 +18,13 @@
 
 module chunk;
 
-import ../lib/standard_lib;
-import ../lib/standard_lib_macos_silicon;
-import ../lib/file_io;
-import ../lib/net;
-import ../lib/memory;
+import ../lib/std/main;
+import ../lib/net/main;
+import ../lib/file_io/main;
 import config;
 import logger;
 import world/terrain;
+import game/blocks;
 
 // ---------------------------------------------------------------------------
 // constants - chunk dimensions and limits
@@ -248,6 +247,12 @@ fn chunk_get_block(state: str, x: i32, y: i32, z: i32) -> i32 {
 // same as chunk_get_block but takes seed directly (avoids reading from
 // potentially corrupted state buffer during gameplay net_make_buf calls)
 fn chunk_get_block_seed(state: str, x: i32, y: i32, z: i32, seed: i32) -> i32 {
+    return chunk_get_block_seed_h(state, x, y, z, seed, -9999);
+}
+
+// version with pre-computed surface height for this column
+// pass -9999 to fall back to computing height from terrain_height
+fn chunk_get_block_seed_h(state: str, x: i32, y: i32, z: i32, seed: i32, cached_h: i32) -> i32 {
     let count: i32 = cs_count(state);
 
     let i: i32 = 0;
@@ -262,7 +267,20 @@ fn chunk_get_block_seed(state: str, x: i32, y: i32, z: i32, seed: i32) -> i32 {
         i = i + 1;
     }
 
-    // use terrain generation with the provided seed
+    // use terrain generation with pre-computed height when available
+    if (cached_h != -9999) {
+        // near surface: full tree + vegetation check
+        if (y > cached_h - 10 && y < cached_h + 20) {
+            return terrain_block_with_trees_h(x, y, z, seed, cached_h);
+        }
+        // far from surface: just basic terrain (no trees)
+        return terrain_block_at_h(x, y, z, seed, cached_h);
+    }
+
+    // fallback without cached height - only check trees near surface
+    if (y > -50 && y < 200) {
+        return terrain_block_with_trees(x, y, z, seed);
+    }
     return terrain_block_at(x, y, z, seed);
 }
 
@@ -272,10 +290,10 @@ fn chunk_get_block_seed(state: str, x: i32, y: i32, z: i32, seed: i32) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn default_block_at(y: i32) -> i32 {
-    if (y < -60) { return BLOCK_BEDROCK(); }
-    if (y < 0) { return BLOCK_STONE(); }
-    if (y == 0) { return BLOCK_GRASS_BLOCK(); }
-    return BLOCK_AIR();
+    if (y < -60) { return BLK_BEDROCK(); }
+    if (y < 0) { return BLK_STONE(); }
+    if (y == 0) { return BLK_GRASS_BLOCK(); }
+    return BLK_AIR();
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +342,14 @@ fn chunk_get_section_block_seed(state: str, chunk_x: i32, chunk_z: i32, section_
     return chunk_get_block_seed(state, world_x, world_y, world_z, seed);
 }
 
+// same as above but with pre-computed terrain height for this column
+fn chunk_get_section_block_seed_h(state: str, chunk_x: i32, chunk_z: i32, section_idx: i32, local_x: i32, local_y: i32, local_z: i32, seed: i32, cached_h: i32) -> i32 {
+    let world_x: i32 = chunk_x * 16 + local_x;
+    let world_y: i32 = (section_idx - 4) * 16 + local_y;
+    let world_z: i32 = chunk_z * 16 + local_z;
+    return chunk_get_block_seed_h(state, world_x, world_y, world_z, seed, cached_h);
+}
+
 // ---------------------------------------------------------------------------
 // check if a chunk section is uniform (all same block)
 // returns the block id if uniform, or -1 if mixed
@@ -336,8 +362,8 @@ fn chunk_section_uniform_block(state: str, chunk_x: i32, chunk_z: i32, section_i
 
     // with terrain generation, most sections near the surface are mixed
     // only sections well above or below terrain can be uniform
-    // sections above y=200 are always air (no terrain goes that high)
-    if (base_y >= 200) {
+    // sections above y=256 are always air (mountains can reach ~250)
+    if (base_y >= 256) {
         // check for mods in this section
         let has_mods_high: bool = false;
         let ih: i32 = 0;
@@ -355,7 +381,7 @@ fn chunk_section_uniform_block(state: str, chunk_x: i32, chunk_z: i32, section_i
             }
             ih = ih + 1;
         }
-        if (!has_mods_high) { return BLOCK_AIR(); }
+        if (!has_mods_high) { return BLK_AIR(); }
     }
 
     // for all other sections, we need to check block by block
@@ -389,7 +415,7 @@ fn chunk_section_non_air(state: str, chunk_x: i32, chunk_z: i32, section_idx: i3
     let base_y: i32 = (section_idx - 4) * 16;
 
     // sections way above terrain are all air - quick shortcut
-    if (base_y >= 200) {
+    if (base_y >= 256) {
         // check for mods first
         let count_h: i32 = cs_count(state);
         let has_m: bool = false;

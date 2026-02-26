@@ -9,10 +9,8 @@
 
 module packet;
 
-import ../../lib/standard_lib;
-import ../../lib/standard_lib_macos_silicon;
-import ../../lib/net;
-import ../../lib/memory;
+import ../../lib/std/main;
+import ../../lib/net/main;
 
 // ---------------------------------------------------------------------------
 // read a single byte from a string buffer as unsigned 0-255

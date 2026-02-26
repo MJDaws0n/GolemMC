@@ -12,10 +12,9 @@
 
 module config_phase;
 
-import ../../lib/standard_lib;
-import ../../lib/standard_lib_macos_silicon;
-import ../../lib/net;
-import ../../lib/file_io;
+import ../../lib/std/main;
+import ../../lib/net/main;
+import ../../lib/file_io/main;
 import ../logger;
 import packet;
 import writer;

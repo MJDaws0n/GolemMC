@@ -2,3 +2,5 @@ session.id
 example/
 server.jar
 .gitignore
+lib
+build

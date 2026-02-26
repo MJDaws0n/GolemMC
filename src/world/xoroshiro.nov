@@ -1,0 +1,141 @@
+// ---------------------------------------------------------------------------
+// xoroshiro.nov - XORoshiro128++ PRNG (MC's exact RNG since 1.18)
+//
+// literally the backbone of ALL minecraft world generation fr fr
+// every noise sampler, every permutation table, every random choice
+// flows through this bad boy. same algorithm = same seed = same world
+//
+// state = two i64 values (s0, s1) stored as globals
+// we save/restore state when we need multiple independent streams
+// ---------------------------------------------------------------------------
+
+module xoroshiro;
+
+// ---------------------------------------------------------------------------
+// bit rotation - left rotate a 64-bit value
+// novus >> is arithmetic shift (sign-extends), so we mask for logical shift
+// ---------------------------------------------------------------------------
+
+fn rotl64(x: i64, k: i64) -> i64 {
+    if (k == 0) { return x; }
+    let left: i64 = x << k;
+    let rsh: i64 = 64 - k;
+    let right: i64 = x >> rsh;
+    // mask off sign-extended bits to get logical right shift
+    let mask: i64 = 0;
+    if (k < 63) {
+        mask = (1 << k) - 1;
+    } else {
+        mask = -1; // all bits set
+    }
+    right = right & mask;
+    return left | right;
+}
+
+// logical right shift helper (used in stafford mix)
+fn lsr64(x: i64, k: i64) -> i64 {
+    if (k == 0) { return x; }
+    let shifted: i64 = x >> k;
+    // mask off sign-extended bits
+    let keep: i64 = 64 - k;
+    let mask: i64 = 0;
+    if (keep < 63) {
+        mask = (1 << keep) - 1;
+    } else {
+        mask = -1;
+    }
+    return shifted & mask;
+}
+
+// ---------------------------------------------------------------------------
+// xoroshiro128++ state - two global i64s
+// we use save/restore for multi-stream support
+// ---------------------------------------------------------------------------
+
+let xoro_s0: i64 = 0;
+let xoro_s1: i64 = 0;
+
+fn xoro_seed(lo: i64, hi: i64) -> void {
+    xoro_s0 = lo;
+    xoro_s1 = hi;
+    if (lo == 0 && hi == 0) {
+        // degenerate state = bad vibes, use golden ratio constant
+        xoro_s0 = -7046029254386353131;
+        xoro_s1 = 362436069;
+    }
+}
+
+fn xoro_next() -> i64 {
+    let s0: i64 = xoro_s0;
+    let s1: i64 = xoro_s1;
+    let result: i64 = rotl64(s0 + s1, 17) + s0;
+    s1 = s1 ^ s0;
+    xoro_s0 = rotl64(s0, 49) ^ s1 ^ (s1 << 21);
+    xoro_s1 = rotl64(s1, 28);
+    return result;
+}
+
+// random f64 in [0.0, 1.0) - exact same as MC's nextDouble
+fn xoro_next_double() -> f64 {
+    let bits: i64 = xoro_next();
+    let shifted: i64 = lsr64(bits, 11); // upper 53 bits (logical shift)
+    let fval: f64 = i64_to_f64(shifted);
+    return fval / 9007199254740992.0; // 2^53
+}
+
+// random i32 in [0, bound) - for shuffling perm tables
+fn xoro_next_int(bound: i32) -> i32 {
+    let r: i64 = xoro_next();
+    if (r < 0) { r = 0 - r; }
+    let b: i64 = i64_from_i32(bound);
+    return i64_to_i32(r % b);
+}
+
+// ---------------------------------------------------------------------------
+// MC seed mixing - stafford mix13 variant of splitmix64
+//
+// minecraft creates unique PRNG states for each noise parameter by mixing
+// the world seed with a salt value. this is how you get different noise
+// patterns for continentalness vs erosion vs temperature etc
+// ---------------------------------------------------------------------------
+
+fn stafford_mix13(z: i64) -> i64 {
+    let z1: i64 = z ^ lsr64(z, 30);
+    z1 = z1 * (-7723592293110705685); // 0xBF58476D1CE4E5B9
+    let z2: i64 = z1 ^ lsr64(z1, 27);
+    z2 = z2 * (-4658895280553007687); // 0x94D049BB133111EB
+    return z2 ^ lsr64(z2, 31);
+}
+
+// seed the PRNG from world seed + salt (each noise gets a unique salt)
+fn xoro_seed_from_world(world_seed: i64, salt: i64) -> void {
+    let mixed: i64 = world_seed ^ salt;
+    let lo: i64 = stafford_mix13(mixed);
+    let hi: i64 = stafford_mix13(mixed + (-7046029254386353131));
+    xoro_seed(lo, hi);
+}
+
+// ---------------------------------------------------------------------------
+// i32 <-> i64 helpers
+// ---------------------------------------------------------------------------
+
+fn i64_from_i32(v: i32) -> i64 {
+    let r: i64 = 0;
+    r = r + v;
+    return r;
+}
+
+fn i64_to_i32(v: i64) -> i32 {
+    let r: i32 = 0;
+    r = r + v;
+    return r;
+}
+
+// save/restore for multi-stream PRNG
+fn xoro_save_s0() -> i64 { return xoro_s0; }
+fn xoro_save_s1() -> i64 { return xoro_s1; }
+
+fn xoro_restore(s0: i64, s1: i64) -> void {
+    xoro_s0 = s0;
+    xoro_s1 = s1;
+}

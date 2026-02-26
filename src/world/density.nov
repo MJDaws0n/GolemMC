@@ -1,0 +1,272 @@
+// ---------------------------------------------------------------------------
+// density.nov - density-based terrain shape (MC's approach)
+//
+// this is where the magic happens no cap. minecraft generates terrain by
+// evaluating a density function at every point in 3D space. if density > 0
+// it's air, if density <= 0 it's stone (roughly speaking)
+//
+// the key terrain noises:
+//   continentalness → how far from ocean (controls base height)
+//   erosion → how rough/smooth the terrain is  
+//   ridges (weirdness) → creates mountain ridges and valleys
+//
+// these are combined through "offset" and "factor" splines to determine:
+//   offset = base terrain height above/below sea level
+//   factor = how much the 3D noise affects the final shape
+//
+// the final density at (x,y,z) is approximately:
+//   density = squeeze(0.64 * (4 * quarter_neg(depth * factor) + 3d_noise))
+// where:
+//   depth = y_clamped_gradient + offset
+//   (positive depth = underground, negative = above surface)
+//
+// this file implements a simplified but faithful version of MC's density
+// function system. the spline tables are approximated from vanilla data.
+// ---------------------------------------------------------------------------
+
+module density;
+
+// ---------------------------------------------------------------------------
+// MC terrain constants
+// ---------------------------------------------------------------------------
+
+fn MC_SEA_LEVEL() -> i32 { return 63; }
+fn MC_MIN_Y() -> i32 { return -64; }
+fn MC_MAX_Y() -> i32 { return 320; }
+fn MC_HEIGHT() -> i32 { return 384; }
+
+// ---------------------------------------------------------------------------
+// spline-like offset function
+//
+// MC uses multi-dimensional splines indexed by (continentalness, erosion,
+// ridges_folded). the full spline data is hundreds of control points.
+//
+// we approximate this with a simplified lookup that captures the key
+// terrain features: ocean basins, plains, hills, mountains
+//
+// offset determines the base Y height of the terrain surface
+// positive offset = terrain above sea level
+// negative offset = terrain below sea level (ocean floor)
+// ---------------------------------------------------------------------------
+
+// ridges_folded = -(|weirdness * 2| - 1)
+// peaks when weirdness near 0, valleys when weirdness near ±1
+fn ridges_folded(weirdness: f64) -> f64 {
+    return -(f64_abs(weirdness * 2.0) - 1.0);
+}
+
+// simplified offset spline - approximates MC's terrain height
+// inputs are all in [-1, 1] range from the noise samplers
+fn density_offset(cont: f64, eros: f64, ridges: f64) -> f64 {
+    // continentalness controls the big picture: ocean vs land
+    // cont < -0.11: deep ocean
+    // cont -0.11 to 0.03: ocean/coast
+    // cont 0.03 to 0.3: inland
+    // cont 0.3 to 0.5: mid-inland
+    // cont > 0.5: far inland (mountains possible)
+    
+    let base: f64 = 0.0;
+    
+    // ocean depth
+    if (cont < -0.11) {
+        // deep ocean: base is well below sea level
+        base = -0.4 + (cont + 0.11) * 1.5;
+        // erosion makes ocean floor rougher when low
+        base = base + eros * 0.05;
+        return base;
+    }
+    
+    // coast transition
+    if (cont < 0.03) {
+        // transition from ocean to land
+        let t: f64 = (cont + 0.11) / 0.14; // 0..1 through transition
+        let ocean_base: f64 = -0.4;
+        let land_base: f64 = 0.0;
+        base = ocean_base + t * (land_base - ocean_base);
+        return base;
+    }
+    
+    // inland terrain - erosion and ridges matter here
+    if (cont < 0.3) {
+        // regular inland: plains to hills
+        // erosion controls how flat vs hilly
+        // high erosion = flat plains, low erosion = hills
+        let hill_factor: f64 = (1.0 - eros) * 0.5; // 0..0.5
+        // ridges create peaks and valleys
+        let ridge_effect: f64 = 0.0;
+        if (ridges > 0.0) {
+            ridge_effect = ridges * hill_factor * 0.8;
+        } else {
+            // valleys are less extreme
+            ridge_effect = ridges * 0.15;
+        }
+        base = hill_factor * 0.3 + ridge_effect;
+        return base;
+    }
+    
+    if (cont < 0.5) {
+        // mid-inland: more mountainous potential
+        let hill_factor: f64 = (1.0 - eros) * 0.8;
+        let ridge_effect: f64 = 0.0;
+        if (ridges > 0.0) {
+            ridge_effect = ridges * hill_factor * 1.2;
+        } else {
+            ridge_effect = ridges * 0.2;
+        }
+        base = hill_factor * 0.4 + ridge_effect;
+        return base;
+    }
+    
+    // far inland: tallest mountains, deepest valleys
+    let hill_factor: f64 = (1.0 - eros) * 1.0;
+    let ridge_effect: f64 = 0.0;
+    if (ridges > 0.5) {
+        // extreme peaks
+        ridge_effect = (ridges - 0.5) * 2.0 * hill_factor * 2.0;
+    } else if (ridges > 0.0) {
+        ridge_effect = ridges * hill_factor * 1.5;
+    } else {
+        // valleys
+        ridge_effect = ridges * 0.3;
+    }
+    base = hill_factor * 0.5 + ridge_effect;
+    
+    return base;
+}
+
+// simplified factor spline
+// factor controls how much 3D noise affects terrain shape
+// high factor = more terrain detail, low factor = smoother
+fn density_factor(cont: f64, eros: f64, ridges: f64) -> f64 {
+    // ocean: very high factor (terrain falls off quickly)
+    if (cont < -0.11) {
+        return 6.0;
+    }
+    // coast: transitioning
+    if (cont < 0.03) {
+        return 5.0;
+    }
+    // inland: factor depends on erosion
+    // high erosion = low factor (flat terrain)
+    // low erosion = medium factor (detailed hills)
+    let f: f64 = 4.0 - eros * 2.0;
+    if (f < 1.5) { f = 1.5; }
+    
+    // mountains need higher factor for sharp peaks
+    if (cont > 0.5 && ridges > 0.5) {
+        f = f + (ridges - 0.5) * 4.0;
+    }
+    
+    return f;
+}
+
+// ---------------------------------------------------------------------------
+// core density function
+//
+// this evaluates the terrain density at a world position (x, y, z)
+// positive = air, negative/zero = solid
+// ---------------------------------------------------------------------------
+
+// y_clamped_gradient: maps y position to a gradient value
+// at y=min_y returns 1.5, at y=max_y returns -1.5
+// this is the basic "stuff is solid below, air above" gradient
+fn y_clamped_gradient(wy: f64) -> f64 {
+    let min_y: f64 = -64.0;
+    let max_y: f64 = 320.0;
+    if (wy <= min_y) { return 1.5; }
+    if (wy >= max_y) { return -1.5; }
+    return 1.5 - 3.0 * (wy - min_y) / (max_y - min_y);
+}
+
+// quarter_negative: MC's quarter_neg function
+// maps x -> x/4 when x < 0, x when x >= 0
+// this makes underground terrain less extreme than surface features
+fn quarter_neg(x: f64) -> f64 {
+    if (x < 0.0) { return x * 0.25; }
+    return x;
+}
+
+// squeeze: MC's squeeze function for clamping density
+// smoothly squeezes values into a reasonable range
+fn squeeze(x: f64) -> f64 {
+    let clamped: f64 = f64_clamp(x, -1.0, 1.0);
+    return clamped / 2.0 - clamped * clamped * clamped / 24.0;
+}
+
+// ---------------------------------------------------------------------------
+// main density evaluation
+// 
+// wx, wz: world x,z coordinates (block coordinates)
+// wy: world y coordinate
+// seed: world seed (noise must be initialized first)
+//
+// returns: density value. > 0 means air, <= 0 means solid
+// ---------------------------------------------------------------------------
+
+fn density_at(wx: i32, wy: i32, wz: i32) -> f64 {
+    let x: f64 = i64_to_f64(i64_from_i32(wx));
+    let y: f64 = i64_to_f64(i64_from_i32(wy));
+    let z: f64 = i64_to_f64(i64_from_i32(wz));
+    
+    // sample the key terrain noises (these are 2D for the shape)
+    let cont: f64 = noise_sample_continentalness(x, z);
+    let eros: f64 = noise_sample_erosion(x, z);
+    let weird: f64 = noise_sample_weirdness(x, z);
+    let ridges: f64 = ridges_folded(weird);
+    
+    // get offset and factor from spline-like functions
+    let offset: f64 = density_offset(cont, eros, ridges);
+    let factor: f64 = density_factor(cont, eros, ridges);
+    
+    // depth = gradient + offset
+    // positive depth = we're underground, negative = we're above surface
+    let gradient: f64 = y_clamped_gradient(y);
+    let depth: f64 = gradient + offset;
+    
+    // 3D base noise adds terrain detail (caves, overhangs, etc)
+    let noise_3d: f64 = noise_sample_3d_base(x / 80.0, y / 80.0, z / 80.0);
+    
+    // MC's core formula: squeeze(0.64 * (4 * quarter_neg(depth * factor) + noise_3d))
+    let shaped: f64 = 4.0 * quarter_neg(depth * factor) + noise_3d * 0.5;
+    let density: f64 = squeeze(0.64 * shaped);
+    
+    return density;
+}
+
+// ---------------------------------------------------------------------------
+// simplified terrain height computation
+//
+// finds the surface Y at a given (x,z) by binary searching for where
+// density transitions from solid to air. much faster than evaluating
+// every Y level.
+// ---------------------------------------------------------------------------
+
+fn density_terrain_height(wx: i32, wz: i32) -> i32 {
+    // binary search for the surface between y=-64 and y=256
+    let lo: i32 = -64;
+    let hi: i32 = 256;
+    
+    // first check if it's all air (very high elevation) or all solid
+    let d_lo: f64 = density_at(wx, lo, wz);
+    let d_hi: f64 = density_at(wx, hi, wz);
+    
+    // if top is solid, surface is above 256 (shouldn't happen normally)
+    if (d_hi <= 0.0) { return hi; }
+    // if bottom is air, surface is below -64 (deep ocean void)
+    if (d_lo > 0.0) { return lo; }
+    
+    // binary search: find the Y where density transitions from <= 0 to > 0
+    while (hi - lo > 1) {
+        let mid: i32 = (lo + hi) / 2;
+        let d: f64 = density_at(wx, mid, wz);
+        if (d <= 0.0) {
+            // solid - surface is above this
+            lo = mid;
+        } else {
+            // air - surface is at or below this
+            hi = mid;
+        }
+    }
+    
+    return lo; // last solid Y
+}

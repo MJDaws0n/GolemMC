@@ -171,27 +171,24 @@ previously: the 6th+ parameter name was emitted raw into assembly, causing assem
 
 ## 16. f64 type generates integer assembly (BROKEN)
 
-**STATUS: OPEN ❌**
+**STATUS: FIXED ✅**
 
-the `f64` type is accepted by the compiler syntax-wise but generates completely wrong code. it uses integer registers (`x10`, `x11`) and integer instructions (`add`, `mul`, `sdiv`) instead of floating point registers (`d0`, `d1`) and float instructions (`fadd`, `fmul`, `fdiv`).
+~~the `f64` type is accepted by the compiler syntax-wise but generates completely wrong code.~~
+
+**fixed**: the compiler now generates proper ARM64 floating-point instructions. float literals store IEEE 754 bit patterns, arithmetic uses `fadd`/`fsub`/`fmul`/`fdiv` with `d` registers, comparisons use `fcmp`. new builtins added: `i64_to_f64()`, `f64_to_i64()`, `f64_bits()`, `f64_from_bits()`.
 
 ```novus
-let a: f64 = 3.14;    // generates: mov x10, #3  (truncates to integer!)
-let b: f64 = 2.0;     // generates: mov x10, #2
-let c: f64 = a + b;   // generates: add x10, x11, x12  (integer add, not fadd)
-let d: f64 = a * b;   // generates: mul x10, x11, x12  (integer mul, not fmul)
-let e: f64 = a / b;   // generates: sdiv x10, x11, x12 (integer div, not fdiv)
+let a: f64 = 3.14;         // now: movz/movk with correct IEEE 754 bits
+let b: f64 = 2.0;          // now: movz/movk 0x4000000000000000
+let c: f64 = a + b;        // now: fmov d1,x11; fmov d2,x12; fadd d0,d1,d2
+let d: f64 = a * b;        // now: fmul d0, d1, d2
+let n: i64 = f64_to_i64(c); // now: fmov d0,x11; fcvtzs x10,d0
+let f: f64 = i64_to_f64(42); // now: scvtf d0, x11; fmov x10, d0
 ```
 
-**expected**: should use ARM64 floating-point instructions (`fmov`, `fadd`, `fmul`, `fdiv`) and `d` registers.
+**verified**: `3.14 * 100.0 = 314`, `3.14 + 2.0 = 5` (truncated), comparisons work, negation works.
 
-**actual**: `3.14` becomes `3`. all arithmetic is integer. results are completely wrong.
-
-**impact**: any code using `f64` will silently produce wrong results. no compiler error or warning.
-
-**workaround**: use `i64` fixed-point arithmetic (e.g. 16 fractional bits, `65536 = 1.0`). this is what GolemMC terrain generation uses.
-
-also missing: no `f64_to_i64()`, `i64_to_f64()`, `f64_to_str()` functions in the standard library, and no `sin()`, `cos()`, `sqrt()`, `floor()` etc. but those are feature requests not bugs.
+still missing from stdlib: `f64_to_str()`, `sin()`, `cos()`, `sqrt()`, `floor()` — feature requests not bugs.
 
 ---
 
@@ -214,6 +211,6 @@ also missing: no `f64_to_i64()`, `i64_to_f64()`, `f64_to_str()` functions in the
 | 13 | i32 arithmetic no 32-bit truncation | **OPEN** ❌ |
 | 14 | variable names = ARM64 register names | **OPEN** ❌ |
 | 15 | 6th+ function parameter | **FIXED** ✅ |
-| 16 | f64 generates integer assembly | **OPEN** ❌ |
+| 16 | f64 generates integer assembly | **FIXED** ✅ |
 
-**11 fixed / 5 still open**
+**12 fixed / 4 still open**

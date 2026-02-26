@@ -48,12 +48,16 @@ A Minecraft server. Not written in Java. Written in [Novus](https://github.com/M
 | RCON | ❌ todo | remote console |
 
 ## how to build & run
+Install [novus](https://github.com/mjdaws0n/novus) and [nox](https://github.com/mjdaws0n/nox).
 
 ```bash
-# compile it
-./novus main.nov
+# Add libraries
+nox init
 
-# sign the binary (macos requirement)
+# compile it
+novus main.nov
+
+# Sign the binary if you want
 codesign -s - --force build/darwin_arm64/GolemMC
 
 # run it (default port 25565)
@@ -64,36 +68,6 @@ codesign -s - --force build/darwin_arm64/GolemMC
 ```
 
 Then add `localhost:25565` to your Minecraft server list and watch it appear.
-
-## project structure
-
-```
-main.nov              - entry point, CLI args, main server loop
-src/
-  config.nov          - server.properties loading/generation
-  world.nov           - world folder & seed file generation
-  chunk.nov           - chunk storage, block modifications, save/load
-  world/
-    terrain.nov       - perlin noise terrain generation (hills, caves, ores)
-  logger.nov          - timestamped logging (info/warn/error/debug)
-  console.nov         - non-blocking console input for commands
-  net/
-    tcp.nov           - TCP server socket wrapper
-    packet.nov        - MC VarInt encoding & packet framing
-    protocol.nov      - MC protocol handler (handshake → SLP or login → config → play)
-    login.nov         - login sequence (login start, success, acknowledged)
-    config_phase.nov  - configuration phase (registry data, known packs, finish config)
-    play.nov          - play state (join game, chunks, position, keepalive, block break/place)
-    writer.nov        - binary data writing helpers (integers, floats, strings, positions, UUIDs)
-    embedded_registries.nov - all 19 MC 1.21.11 registries as byte arrays
-lib/
-  net.nov             - low-level networking syscalls + SIGPIPE handling
-  standard_lib.nov    - core string/number utilities
-  standard_lib_macos_silicon.nov - macOS ARM64 syscalls
-  file_io.nov         - file operations
-  memory.nov          - memory & string utilities
-  maths.nov           - math helpers
-```
 
 ## console commands
 
@@ -121,6 +95,7 @@ The `server.properties` file gets auto-generated on first run. You can edit it t
 
 ## requirements
 
-- macOS on Apple Silicon (M1/M2/M3/M4)
+- macOS on Apple Silicon (M1/M2/M3/M4) (Windows may work, only tested on macos)
 - The [Novus compiler](https://github.com/mjdaws0n/novus) (included as `novus` binary)
+- The [Nox package manager](https://github.com/mjdaws0n/nox) (included as `nox` binary)
 - Minecraft Java Edition 1.21.11 (to actually connect)

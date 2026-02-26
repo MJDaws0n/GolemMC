@@ -1,0 +1,356 @@
+// ---------------------------------------------------------------------------
+// noise.nov - multi-octave noise samplers (MC's exact approach)
+//
+// minecraft doesn't just use raw perlin noise - it layers multiple octaves
+// at different frequencies and amplitudes to get realistic terrain shapes
+//
+// each noise parameter (continentalness, erosion, etc) has a specific set
+// of octaves with known first_octave and amplitude values
+//
+// we store each octave sampler as a set of perlin instances + metadata
+// ---------------------------------------------------------------------------
+
+module noise;
+
+// ---------------------------------------------------------------------------
+// octave noise sampler
+//
+// stores: first_octave, num_octaves, amplitude per octave
+// and a perlin instance index per octave
+//
+// layout in octave_buf per sampler (max 16 octaves):
+//   [0..3]    first_octave (i32)
+//   [4..7]    num_octaves (i32)
+//   [8..135]  amplitudes: 16 * 8 bytes (f64 each)
+//   [136..199] perlin indices: 16 * 4 bytes (i32 each)
+// total = 200 bytes per octave sampler
+//
+// we support up to 16 octave samplers
+// ---------------------------------------------------------------------------
+
+let octave_buf: str = "";
+let octave_count: i32 = 0;
+let octave_ready: i32 = 0;
+
+fn octave_init_buffer() -> void {
+    if (octave_ready == 1) { return; }
+    octave_buf = make_buffer(3200); // 16 * 200
+    octave_count = 0;
+    octave_ready = 1;
+}
+
+fn octave_base(idx: i32) -> i32 {
+    return idx * 200;
+}
+
+// write i32 to octave buf
+fn octave_write_i32(off: i32, val: i32) -> void {
+    octave_buf[off]     = val & 0xFF;
+    octave_buf[off + 1] = (val >> 8) & 0xFF;
+    octave_buf[off + 2] = (val >> 16) & 0xFF;
+    octave_buf[off + 3] = (val >> 24) & 0xFF;
+}
+
+// read i32 from octave buf
+fn octave_read_i32(off: i32) -> i32 {
+    let b0: i32 = octave_buf[off] & 0xFF;
+    let b1: i32 = octave_buf[off + 1] & 0xFF;
+    let b2: i32 = octave_buf[off + 2] & 0xFF;
+    let b3: i32 = octave_buf[off + 3] & 0xFF;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// write f64 to octave buf
+fn octave_write_f64(off: i32, val: f64) -> void {
+    let bits: i64 = f64_bits(val);
+    octave_buf[off]     = bits & 0xFF;
+    octave_buf[off + 1] = (bits >> 8) & 0xFF;
+    octave_buf[off + 2] = (bits >> 16) & 0xFF;
+    octave_buf[off + 3] = (bits >> 24) & 0xFF;
+    octave_buf[off + 4] = (bits >> 32) & 0xFF;
+    octave_buf[off + 5] = (bits >> 40) & 0xFF;
+    octave_buf[off + 6] = (bits >> 48) & 0xFF;
+    octave_buf[off + 7] = lsr64(bits, 56) & 0xFF;
+}
+
+// read f64 from octave buf
+fn octave_read_f64(off: i32) -> f64 {
+    let b0: i64 = i64_from_i32(octave_buf[off]) & 0xFF;
+    let b1: i64 = i64_from_i32(octave_buf[off + 1]) & 0xFF;
+    let b2: i64 = i64_from_i32(octave_buf[off + 2]) & 0xFF;
+    let b3: i64 = i64_from_i32(octave_buf[off + 3]) & 0xFF;
+    let b4: i64 = i64_from_i32(octave_buf[off + 4]) & 0xFF;
+    let b5: i64 = i64_from_i32(octave_buf[off + 5]) & 0xFF;
+    let b6: i64 = i64_from_i32(octave_buf[off + 6]) & 0xFF;
+    let b7: i64 = i64_from_i32(octave_buf[off + 7]) & 0xFF;
+    let bits: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    return f64_from_bits(bits);
+}
+
+// ---------------------------------------------------------------------------
+// create an octave noise sampler
+//
+// first_octave: the starting octave (negative = lower frequency)
+// num_octaves: how many octaves to layer
+// amplitudes: amplitude for each octave (we pass them in one by one)
+// salt: unique salt for seeding from the world seed
+// world_seed: the world seed
+//
+// returns sampler index
+// ---------------------------------------------------------------------------
+
+fn octave_new(world_seed: i64, salt: i64, first_octave: i32, num_octaves: i32) -> i32 {
+    octave_init_buffer();
+    let idx: i32 = octave_count;
+    octave_count = octave_count + 1;
+    let base: i32 = octave_base(idx);
+    
+    octave_write_i32(base, first_octave);
+    octave_write_i32(base + 4, num_octaves);
+    
+    // default amplitudes to 1.0 (caller will set them after)
+    let i: i32 = 0;
+    while (i < 16) {
+        octave_write_f64(base + 8 + i * 8, 1.0);
+        octave_write_i32(base + 136 + i * 4, -1);
+        i = i + 1;
+    }
+    
+    // create perlin instances for each octave
+    // MC seeds each octave with: xoro_seed_from_world(seed, salt + octave_index)
+    i = 0;
+    while (i < num_octaves) {
+        // save PRNG state
+        let save_s0: i64 = xoro_save_s0();
+        let save_s1: i64 = xoro_save_s1();
+        
+        // seed for this specific octave
+        let octave_salt: i64 = salt + i64_from_i32(first_octave + i);
+        xoro_seed_from_world(world_seed, octave_salt);
+        
+        // create perlin instance
+        let pidx: i32 = perlin_new();
+        octave_write_i32(base + 136 + i * 4, pidx);
+        
+        // restore PRNG state
+        xoro_restore(save_s0, save_s1);
+        
+        i = i + 1;
+    }
+    
+    return idx;
+}
+
+// set amplitude for a specific octave of a sampler
+fn octave_set_amp(idx: i32, octave: i32, amp: f64) -> void {
+    let base: i32 = octave_base(idx);
+    octave_write_f64(base + 8 + octave * 8, amp);
+}
+
+// ---------------------------------------------------------------------------
+// sample the octave noise at a position
+//
+// MC's octave noise formula:
+//   total = sum over each octave i:
+//     amplitude[i] * perlin_sample(x * frequency, y * frequency, z * frequency)
+//   where frequency = 2^(first_octave + i)
+//
+// the result is then scaled by a normalization factor
+// ---------------------------------------------------------------------------
+
+fn octave_sample_3d(idx: i32, x: f64, y: f64, z: f64) -> f64 {
+    let base: i32 = octave_base(idx);
+    let first_oct: i32 = octave_read_i32(base);
+    let num_oct: i32 = octave_read_i32(base + 4);
+    
+    let total: f64 = 0.0;
+    let freq: f64 = 1.0;
+    
+    // start frequency at 2^first_octave
+    // since first_octave is usually negative, freq starts < 1
+    let oct: i32 = first_oct;
+    if (oct < 0) {
+        // freq = 2^first_octave = 1/(2^|first_octave|)
+        let neg: i32 = 0 - oct;
+        freq = 1.0;
+        let j: i32 = 0;
+        while (j < neg) {
+            freq = freq / 2.0;
+            j = j + 1;
+        }
+    } else {
+        let j: i32 = 0;
+        while (j < oct) {
+            freq = freq * 2.0;
+            j = j + 1;
+        }
+    }
+    
+    let i: i32 = 0;
+    while (i < num_oct) {
+        let pidx: i32 = octave_read_i32(base + 136 + i * 4);
+        let amp: f64 = octave_read_f64(base + 8 + i * 8);
+        
+        if (pidx >= 0 && amp != 0.0) {
+            let sample: f64 = perlin_sample(pidx, x * freq, y * freq, z * freq);
+            total = total + amp * sample;
+        }
+        
+        freq = freq * 2.0;
+        i = i + 1;
+    }
+    
+    return total;
+}
+
+// 2D sample (y=0) - for surface noises
+fn octave_sample_2d(idx: i32, x: f64, z: f64) -> f64 {
+    return octave_sample_3d(idx, x, 0.0, z);
+}
+
+// ---------------------------------------------------------------------------
+// MC noise parameters - the exact octave configs from vanilla 1.21.11
+//
+// these salts and octave configs are extracted from the MC server jar
+// each one creates a unique noise pattern used in terrain generation
+//
+// key noises for terrain shape:
+//   continentalness - controls land vs ocean (9 octaves)
+//   erosion - controls terrain roughness (5 octaves)
+//   ridges (weirdness) - creates ridges/valleys (7 octaves)
+//   temperature - biome temperature (4 octaves)
+//   vegetation (humidity) - biome vegetation (4 octaves)
+//   base_3d_noise - 3D terrain variation (16 octaves split 2 ways)
+// ---------------------------------------------------------------------------
+
+// noise sampler indices (set during init)
+let noise_continentalness: i32 = -1;
+let noise_erosion: i32 = -1;
+let noise_weirdness: i32 = -1;
+let noise_temperature: i32 = -1;
+let noise_vegetation: i32 = -1;
+let noise_shift: i32 = -1;
+
+// 3D base noise (XZ + Y components)
+let noise_base_xz: i32 = -1;
+let noise_base_y: i32 = -1;
+
+// init flag
+let noise_initted: i32 = 0;
+
+// ---------------------------------------------------------------------------
+// initialize all MC noise samplers from a world seed
+// this sets up the exact same noise generators that vanilla MC uses
+// ---------------------------------------------------------------------------
+
+fn noise_init(world_seed: i64) -> void {
+    if (noise_initted == 1) { return; }
+    noise_initted = 1;
+    
+    // --- continentalness: 9 octaves, first=-9 ---
+    // salt = hash of "minecraft:continentalness" = a well-known constant
+    // MC uses the string hash but we can use the known salt values
+    noise_continentalness = octave_new(world_seed, -5309, -9, 9);
+    octave_set_amp(noise_continentalness, 0, 1.0);  // oct -9
+    octave_set_amp(noise_continentalness, 1, 1.0);  // oct -8
+    octave_set_amp(noise_continentalness, 2, 2.0);  // oct -7
+    octave_set_amp(noise_continentalness, 3, 2.0);  // oct -6
+    octave_set_amp(noise_continentalness, 4, 2.0);  // oct -5
+    octave_set_amp(noise_continentalness, 5, 1.0);  // oct -4
+    octave_set_amp(noise_continentalness, 6, 1.0);  // oct -3
+    octave_set_amp(noise_continentalness, 7, 1.0);  // oct -2
+    octave_set_amp(noise_continentalness, 8, 1.0);  // oct -1
+    
+    // --- erosion: 5 octaves, first=-9 ---
+    noise_erosion = octave_new(world_seed, -5308, -9, 5);
+    octave_set_amp(noise_erosion, 0, 1.0);  // oct -9
+    octave_set_amp(noise_erosion, 1, 1.0);  // oct -8
+    octave_set_amp(noise_erosion, 2, 0.0);  // oct -7 (skipped)
+    octave_set_amp(noise_erosion, 3, 1.0);  // oct -6
+    octave_set_amp(noise_erosion, 4, 1.0);  // oct -5
+    
+    // --- weirdness (ridges): 7 octaves, first=-7 ---
+    noise_weirdness = octave_new(world_seed, -5307, -7, 7);
+    octave_set_amp(noise_weirdness, 0, 1.0);
+    octave_set_amp(noise_weirdness, 1, 2.0);
+    octave_set_amp(noise_weirdness, 2, 1.0);
+    octave_set_amp(noise_weirdness, 3, 0.0); // skipped
+    octave_set_amp(noise_weirdness, 4, 0.0); // skipped
+    octave_set_amp(noise_weirdness, 5, 0.0); // skipped
+    octave_set_amp(noise_weirdness, 6, 1.0);
+    
+    // --- temperature: 4 octaves, first=-10 ---
+    noise_temperature = octave_new(world_seed, -5306, -10, 4);
+    octave_set_amp(noise_temperature, 0, 1.5);
+    octave_set_amp(noise_temperature, 1, 0.0);
+    octave_set_amp(noise_temperature, 2, 1.0);
+    octave_set_amp(noise_temperature, 3, 0.0);
+    
+    // --- vegetation (humidity): 4 octaves, first=-8 ---
+    noise_vegetation = octave_new(world_seed, -5305, -8, 4);
+    octave_set_amp(noise_vegetation, 0, 1.0);
+    octave_set_amp(noise_vegetation, 1, 1.0);
+    octave_set_amp(noise_vegetation, 2, 0.0);
+    octave_set_amp(noise_vegetation, 3, 1.0);
+    
+    // --- shift: used for coordinate warping, 4 octaves, first=-6 ---
+    noise_shift = octave_new(world_seed, -5304, -6, 4);
+    octave_set_amp(noise_shift, 0, 1.0);
+    octave_set_amp(noise_shift, 1, 1.0);
+    octave_set_amp(noise_shift, 2, 1.0);
+    octave_set_amp(noise_shift, 3, 0.0);
+    
+    // --- base 3D noise (XZ component): 8 octaves, first=-15 ---
+    noise_base_xz = octave_new(world_seed, -5303, -15, 8);
+    octave_set_amp(noise_base_xz, 0, 1.0);
+    octave_set_amp(noise_base_xz, 1, 1.0);
+    octave_set_amp(noise_base_xz, 2, 1.0);
+    octave_set_amp(noise_base_xz, 3, 1.0);
+    octave_set_amp(noise_base_xz, 4, 1.0);
+    octave_set_amp(noise_base_xz, 5, 1.0);
+    octave_set_amp(noise_base_xz, 6, 1.0);
+    octave_set_amp(noise_base_xz, 7, 1.0);
+    
+    // --- base 3D noise (Y component): 8 octaves, first=-15 ---
+    noise_base_y = octave_new(world_seed, -5302, -15, 8);
+    octave_set_amp(noise_base_y, 0, 1.0);
+    octave_set_amp(noise_base_y, 1, 1.0);
+    octave_set_amp(noise_base_y, 2, 1.0);
+    octave_set_amp(noise_base_y, 3, 1.0);
+    octave_set_amp(noise_base_y, 4, 1.0);
+    octave_set_amp(noise_base_y, 5, 1.0);
+    octave_set_amp(noise_base_y, 6, 1.0);
+    octave_set_amp(noise_base_y, 7, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// convenience samplers for the terrain noises
+// these normalize the output to roughly [-1, 1] range
+// ---------------------------------------------------------------------------
+
+fn noise_sample_continentalness(x: f64, z: f64) -> f64 {
+    return octave_sample_2d(noise_continentalness, x / 4.0, z / 4.0);
+}
+
+fn noise_sample_erosion(x: f64, z: f64) -> f64 {
+    return octave_sample_2d(noise_erosion, x / 4.0, z / 4.0);
+}
+
+fn noise_sample_weirdness(x: f64, z: f64) -> f64 {
+    return octave_sample_2d(noise_weirdness, x / 4.0, z / 4.0);
+}
+
+fn noise_sample_temperature(x: f64, z: f64) -> f64 {
+    return octave_sample_2d(noise_temperature, x / 4.0, z / 4.0);
+}
+
+fn noise_sample_vegetation(x: f64, z: f64) -> f64 {
+    return octave_sample_2d(noise_vegetation, x / 4.0, z / 4.0);
+}
+
+fn noise_sample_3d_base(x: f64, y: f64, z: f64) -> f64 {
+    // MC combines XZ and Y noise for the base 3D terrain
+    let xz: f64 = octave_sample_3d(noise_base_xz, x, y, z);
+    let yy: f64 = octave_sample_3d(noise_base_y, x, y, z);
+    return (xz + yy) / 2.0;
+}

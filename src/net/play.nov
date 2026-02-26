@@ -337,18 +337,22 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
 
         if (is_high_air) {
             // all air - single value palette
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // block count high
             pos = pos + 1;
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // block count low
             pos = pos + 1;
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // bpe = 0
             pos = pos + 1;
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // palette = air (VarInt 0)
+            pos = pos + 1;
+            section_buf[pos] = 0;       // data array length = 0 (VarInt 0)
             pos = pos + 1;
             // biomes
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // bpe = 0
             pos = pos + 1;
-            section_buf[pos] = 0;
+            section_buf[pos] = 0;       // palette = plains (VarInt 0)
+            pos = pos + 1;
+            section_buf[pos] = 0;       // data array length = 0 (VarInt 0)
             pos = pos + 1;
         } else {
             // fill block cache for this section
@@ -414,7 +418,7 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
                 section_buf[pos] = non_air & 255;
                 pos = pos + 1;
 
-                // bpe=0, palette=block_id
+                // bpe=0, palette=block_id, data_array_length=0
                 section_buf[pos] = 0;
                 pos = pos + 1;
                 if (uniform_id < 128) {
@@ -433,11 +437,16 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
                     section_buf[pos] = (uniform_id >> 14) & 127;
                     pos = pos + 1;
                 }
+                // data array length = 0 (required even for bpe=0)
+                section_buf[pos] = 0;
+                pos = pos + 1;
 
-                // biomes
+                // biomes: single value palette (bpe=0, value=0, data_len=0)
                 section_buf[pos] = 0;
                 pos = pos + 1;
                 section_buf[pos] = 0;
+                pos = pos + 1;
+                section_buf[pos] = 0;       // data array length = 0
                 pos = pos + 1;
             } else {
                 // mixed section - indirect palette
@@ -496,9 +505,27 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
                     pi2 = pi2 + 1;
                 }
 
-                // data array - pack block palette indices into longs from cache
+                // data array length as VarInt (required before data longs)
                 let entries_per_long: i32 = 64 / bpe;
                 let num_longs: i32 = (4096 + entries_per_long - 1) / entries_per_long;
+                if (num_longs < 128) {
+                    section_buf[pos] = num_longs;
+                    pos = pos + 1;
+                } else if (num_longs < 16384) {
+                    section_buf[pos] = (num_longs & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = (num_longs >> 7) & 127;
+                    pos = pos + 1;
+                } else {
+                    section_buf[pos] = (num_longs & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = ((num_longs >> 7) & 127) | 128;
+                    pos = pos + 1;
+                    section_buf[pos] = (num_longs >> 14) & 127;
+                    pos = pos + 1;
+                }
+
+                // data array - pack block palette indices into longs from cache
 
                 let entry_idx: i32 = 0;
                 let long_idx: i32 = 0;
@@ -566,10 +593,12 @@ fn send_chunk_data(fd: i32, chunk_x: i32, chunk_z: i32, cs: str, wb: str, seed: 
                     long_idx = long_idx + 1;
                 }
 
-                // biomes
+                // biomes: single value palette (bpe=0, value=0, data_len=0)
                 section_buf[pos] = 0;
                 pos = pos + 1;
                 section_buf[pos] = 0;
+                pos = pos + 1;
+                section_buf[pos] = 0;       // data array length = 0
                 pos = pos + 1;
             }
         }
@@ -746,13 +775,18 @@ fn send_play_login(fd: i32, entity_id: i32, cs: str, wb: str, seed: i32) -> void
     send_game_event(fd, 13, 0);
 
     // 3. figure out spawn height from terrain generation
+    log_debug("play: computing spawn height...");
     let spawn_y: i32 = terrain_height(0, 0, seed) + 1;
+    log_debug("play: spawn_y = " + i32_to_str(spawn_y));
 
     // 3. set default spawn position
     send_spawn_position(fd, 0, spawn_y, 0);
+    log_debug("play: sent spawn position");
 
     // 4. send chunks around spawn
+    log_debug("play: sending spawn chunks (vd=" + i32_to_str(vd) + ")...");
     send_spawn_chunks(fd, vd, cs, wb, seed);
+    log_debug("play: spawn chunks sent");
 
     // 5. teleport player to spawn (on top of the terrain)
     send_player_position(fd, 0, spawn_y + 1, 0, 1);

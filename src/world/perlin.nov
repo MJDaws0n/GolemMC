@@ -1,0 +1,269 @@
+// ---------------------------------------------------------------------------
+// perlin.nov - improved perlin noise (f64 precision) 
+//
+// this is ken perlin's 2002 improved noise algorithm, exactly how mc does it
+// now with actual double-precision math since we fixed f64 in the compiler
+//
+// each perlin instance = 256-byte permutation table + 3 origin offsets
+// stored in a string buffer (novus's way of doing byte arrays basically)
+//
+// buffer layout per instance:
+//   [0..255]   permutation table (shuffled 0..255)
+//   [256..511] perm table copy (for wrapping without modulo)
+//   [512..519] xo offset (f64 bits as 8 bytes LE)
+//   [520..527] yo offset (f64 bits as 8 bytes LE)
+//   [528..535] zo offset (f64 bits as 8 bytes LE)
+// total = 536 bytes per instance
+//
+// we keep up to 64 instances in one big buffer for multi-octave noise
+// ---------------------------------------------------------------------------
+
+module perlin;
+
+// ---------------------------------------------------------------------------
+// f64 math helpers that the compiler doesn't have as builtins yet
+// ---------------------------------------------------------------------------
+
+fn f64_floor(x: f64) -> f64 {
+    let i: i64 = f64_to_i64(x);
+    let fi: f64 = i64_to_f64(i);
+    // f64_to_i64 truncates toward zero, need floor (toward -inf)
+    if (fi > x) { return fi - 1.0; }
+    return fi;
+}
+
+fn f64_abs(x: f64) -> f64 {
+    if (x < 0.0) { return -x; }
+    return x;
+}
+
+fn f64_min(a: f64, b: f64) -> f64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn f64_max(a: f64, b: f64) -> f64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn f64_clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// perlin noise core math
+// ---------------------------------------------------------------------------
+
+// fade curve: 6t^5 - 15t^4 + 10t^3 (the classic smooth interpolant)
+fn perlin_fade(t: f64) -> f64 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// lerp: a + t*(b-a)
+fn perlin_lerp(t: f64, a: f64, b: f64) -> f64 {
+    return a + t * (b - a);
+}
+
+// gradient function - selects one of 12 gradient vectors based on hash
+// this is the standard improved perlin gradient calc
+fn perlin_grad(hash: i32, x: f64, y: f64, z: f64) -> f64 {
+    let h: i32 = hash & 15;
+    
+    let u: f64 = x;
+    if (h >= 8) { u = y; }
+    
+    let v: f64 = y;
+    if (h >= 4) {
+        if (h == 12 || h == 14) {
+            v = x;
+        } else {
+            v = z;
+        }
+    }
+    
+    let r1: f64 = u;
+    if ((h & 1) != 0) { r1 = -u; }
+    
+    let r2: f64 = v;
+    if ((h & 2) != 0) { r2 = -v; }
+    
+    return r1 + r2;
+}
+
+// ---------------------------------------------------------------------------
+// perlin instance storage
+//
+// one big buffer holds all instances. each is 536 bytes.
+// max 64 instances = 34304 bytes total
+// ---------------------------------------------------------------------------
+
+let perlin_buf: str = "";
+let perlin_count: i32 = 0;
+let perlin_ready: i32 = 0;
+
+fn perlin_init_buffer() -> void {
+    if (perlin_ready == 1) { return; }
+    // allocate 64 * 536 = 34304 bytes
+    perlin_buf = make_buffer(34304);
+    perlin_count = 0;
+    perlin_ready = 1;
+}
+
+// get byte offset for instance idx in the big buffer
+fn perlin_offset(idx: i32) -> i32 {
+    return idx * 536;
+}
+
+// write f64 to buffer at offset (as 8 LE bytes)
+fn perlin_write_f64(off: i32, val: f64) -> void {
+    let bits: i64 = f64_bits(val);
+    perlin_buf[off]     = bits & 0xFF;
+    perlin_buf[off + 1] = (bits >> 8) & 0xFF;
+    perlin_buf[off + 2] = (bits >> 16) & 0xFF;
+    perlin_buf[off + 3] = (bits >> 24) & 0xFF;
+    perlin_buf[off + 4] = (bits >> 32) & 0xFF;
+    perlin_buf[off + 5] = (bits >> 40) & 0xFF;
+    perlin_buf[off + 6] = (bits >> 48) & 0xFF;
+    perlin_buf[off + 7] = lsr64(bits, 56) & 0xFF;
+}
+
+// read f64 from buffer at offset (8 LE bytes)
+fn perlin_read_f64(off: i32) -> f64 {
+    let b0: i64 = i64_from_i32(perlin_buf[off]) & 0xFF;
+    let b1: i64 = i64_from_i32(perlin_buf[off + 1]) & 0xFF;
+    let b2: i64 = i64_from_i32(perlin_buf[off + 2]) & 0xFF;
+    let b3: i64 = i64_from_i32(perlin_buf[off + 3]) & 0xFF;
+    let b4: i64 = i64_from_i32(perlin_buf[off + 4]) & 0xFF;
+    let b5: i64 = i64_from_i32(perlin_buf[off + 5]) & 0xFF;
+    let b6: i64 = i64_from_i32(perlin_buf[off + 6]) & 0xFF;
+    let b7: i64 = i64_from_i32(perlin_buf[off + 7]) & 0xFF;
+    let bits: i64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    return f64_from_bits(bits);
+}
+
+// ---------------------------------------------------------------------------
+// create a new perlin instance using the current xoroshiro state
+// returns the instance index
+// ---------------------------------------------------------------------------
+
+fn perlin_new() -> i32 {
+    perlin_init_buffer();
+    let idx: i32 = perlin_count;
+    perlin_count = perlin_count + 1;
+    let base: i32 = perlin_offset(idx);
+    
+    // random origin offset (MC does this to avoid lattice artifacts at 0,0)
+    let xo: f64 = xoro_next_double() * 256.0;
+    let yo: f64 = xoro_next_double() * 256.0;
+    let zo: f64 = xoro_next_double() * 256.0;
+    
+    perlin_write_f64(base + 512, xo);
+    perlin_write_f64(base + 520, yo);
+    perlin_write_f64(base + 528, zo);
+    
+    // init identity permutation [0..255]
+    let i: i32 = 0;
+    while (i < 256) {
+        perlin_buf[base + i] = i;
+        i = i + 1;
+    }
+    
+    // fisher-yates shuffle using xoroshiro
+    i = 0;
+    while (i < 256) {
+        let j: i32 = xoro_next_int(256 - i) + i;
+        // swap perm[i] and perm[j]
+        let a: i32 = perlin_buf[base + i];
+        let b: i32 = perlin_buf[base + j];
+        perlin_buf[base + i] = b;
+        perlin_buf[base + j] = a;
+        i = i + 1;
+    }
+    
+    // double the perm table for easy wrapping
+    i = 0;
+    while (i < 256) {
+        perlin_buf[base + 256 + i] = perlin_buf[base + i];
+        i = i + 1;
+    }
+    
+    return idx;
+}
+
+// read perm value for instance idx at position i (auto-wraps via doubled table)
+fn perlin_perm(idx: i32, i: i32) -> i32 {
+    return perlin_buf[perlin_offset(idx) + (i & 511)];
+}
+
+// get origin offsets
+fn perlin_xo(idx: i32) -> f64 { return perlin_read_f64(perlin_offset(idx) + 512); }
+fn perlin_yo(idx: i32) -> f64 { return perlin_read_f64(perlin_offset(idx) + 520); }
+fn perlin_zo(idx: i32) -> f64 { return perlin_read_f64(perlin_offset(idx) + 528); }
+
+// ---------------------------------------------------------------------------
+// sample 3D perlin noise - returns value roughly in [-1, 1]
+// this is the exact algorithm minecraft uses
+// ---------------------------------------------------------------------------
+
+fn perlin_sample(idx: i32, x: f64, y: f64, z: f64) -> f64 {
+    // add origin offset so different instances give different patterns
+    let px: f64 = x + perlin_xo(idx);
+    let py: f64 = y + perlin_yo(idx);
+    let pz: f64 = z + perlin_zo(idx);
+    
+    // find unit cube containing point
+    let fx: f64 = f64_floor(px);
+    let fy: f64 = f64_floor(py);
+    let fz: f64 = f64_floor(pz);
+    
+    let ix: i32 = i64_to_i32(f64_to_i64(fx)) & 255;
+    let iy: i32 = i64_to_i32(f64_to_i64(fy)) & 255;
+    let iz: i32 = i64_to_i32(f64_to_i64(fz)) & 255;
+    
+    // fractional position within cube
+    let dx: f64 = px - fx;
+    let dy: f64 = py - fy;
+    let dz: f64 = pz - fz;
+    
+    // fade curves for smooth interpolation
+    let u: f64 = perlin_fade(dx);
+    let v: f64 = perlin_fade(dy);
+    let w: f64 = perlin_fade(dz);
+    
+    // hash all 8 cube corners through the permutation table
+    let a:  i32 = perlin_perm(idx, ix) + iy;
+    let aa: i32 = perlin_perm(idx, a) + iz;
+    let ab: i32 = perlin_perm(idx, a + 1) + iz;
+    let b:  i32 = perlin_perm(idx, ix + 1) + iy;
+    let ba: i32 = perlin_perm(idx, b) + iz;
+    let bb: i32 = perlin_perm(idx, b + 1) + iz;
+    
+    // gradient + dot product at each corner
+    let g000: f64 = perlin_grad(perlin_perm(idx, aa),     dx,       dy,       dz);
+    let g100: f64 = perlin_grad(perlin_perm(idx, ba),     dx - 1.0, dy,       dz);
+    let g010: f64 = perlin_grad(perlin_perm(idx, ab),     dx,       dy - 1.0, dz);
+    let g110: f64 = perlin_grad(perlin_perm(idx, bb),     dx - 1.0, dy - 1.0, dz);
+    let g001: f64 = perlin_grad(perlin_perm(idx, aa + 1), dx,       dy,       dz - 1.0);
+    let g101: f64 = perlin_grad(perlin_perm(idx, ba + 1), dx - 1.0, dy,       dz - 1.0);
+    let g011: f64 = perlin_grad(perlin_perm(idx, ab + 1), dx,       dy - 1.0, dz - 1.0);
+    let g111: f64 = perlin_grad(perlin_perm(idx, bb + 1), dx - 1.0, dy - 1.0, dz - 1.0);
+    
+    // trilinear interpolation
+    let x00: f64 = perlin_lerp(u, g000, g100);
+    let x10: f64 = perlin_lerp(u, g010, g110);
+    let x01: f64 = perlin_lerp(u, g001, g101);
+    let x11: f64 = perlin_lerp(u, g011, g111);
+    
+    let y0: f64 = perlin_lerp(v, x00, x10);
+    let y1: f64 = perlin_lerp(v, x01, x11);
+    
+    return perlin_lerp(w, y0, y1);
+}
+
+// sample 2D (y=0) - used for surface-level noises like continentalness
+fn perlin_sample_2d(idx: i32, x: f64, z: f64) -> f64 {
+    return perlin_sample(idx, x, 0.0, z);
+}

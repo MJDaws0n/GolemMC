@@ -1,6 +1,10 @@
-session.id
-example/
-server.jar
-.gitignore
-lib
-build
+/build/
+/lib/std
+/lib/file_io
+/run/
+/server.properties
+/world/
+/*.jar
+node_modules/
+__pycache__/
+.DS_Store

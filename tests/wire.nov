@@ -1,0 +1,25 @@
+module wire_tests;
+
+import ../lib/std;
+import ../src/wire;
+import ../src/settings;
+
+fn main() -> i32 {
+    let payload: Bytes = new Bytes(1);
+    payload.varint(-1);
+    payload.long(-9223372036854775807 - 1);
+    payload.position(-234689, -64, 29344);
+    let wire: Bytes = new Bytes(1);
+    wire.frame(131, payload);
+    let reader: Reader = new Reader(wire.data, 0, wire.size);
+    if (reader.varint() != 23 || reader.varint() != 131 || reader.varint() != -1) { return 1; }
+    if (reader.long() != -9223372036854775807 - 1) { return 2; }
+    let location: i64 = reader.long();
+    if (location >> 38 != -234689 || (location << 52) >> 52 != -64 || (location << 26) >> 38 != 29344) { return 3; }
+    if (!reader.valid || reader.left() != 0) { return 4; }
+    if (!matches_seed("-9223372036854775808", -9223372036854775807 - 1) ||
+        !matches_seed("+000", 0) || !matches_seed("-000", 0)) { return 5; }
+    if (matches_seed("9223372036854775808", -9223372036854775807 - 1) || matches_seed("123x", 123)) { return 6; }
+    if (reader.varint() != 0 || reader.valid) { return 7; }
+    return 0;
+}

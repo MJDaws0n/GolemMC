@@ -1,0 +1,84 @@
+module settings;
+
+import ../lib/std;
+import ../lib/file_io;
+
+class Settings {
+    pub let address: str = "127.0.0.1";
+    pub let port: i32 = 25565;
+    pub let motd: str = "GolemMC";
+    pub let max_players: i32 = 20;
+    pub let view: i32 = 3;
+    pub let mode: i32 = 1;
+    pub let difficulty: i32 = 1;
+    pub let seed: i64 = 0;
+    pub let world: str = "world";
+    pub let source: str = "";
+    pub let error: str = "";
+
+    pub init(path: str) {
+        if (!file_exists(path)) {
+            self.error = write_all_text(path,
+                "server-ip=127.0.0.1\nserver-port=25565\nmotd=GolemMC\nmax-players=20\n" +
+                "view-distance=3\ngamemode=creative\ndifficulty=easy\nlevel-seed=0\n" +
+                "level-name=world\nvanilla-snapshot=\nonline-mode=false\n");
+            return;
+        }
+        let file: FileTextResult = read_all_text(path);
+        self.error = file.error;
+        let lines: []str = string_split(file.data, "\n");
+        for (let index: i32 = 0; index < len(lines); index++) {
+            let line: str = str_trim(lines[index]);
+            if (line == "" || starts_with(line, "#")) { continue; }
+            let equal: i32 = str_find(line, "=");
+            if (equal < 1) { continue; }
+            self.apply(str_trim(substr_len(line, 0, equal)), str_trim(substr(line, equal + 1)));
+        }
+        if (self.port < 1 || self.port > 65535) { self.error = "server-port must be 1–65535"; }
+        if (self.view < 2 || self.view > 8) { self.error = "view-distance must be 2–8"; }
+        if (self.max_players < 1 || self.max_players > 64) { self.error = "max-players must be 1–64"; }
+        if (self.world == "") { self.error = "level-name must not be empty"; }
+        if (len(self.motd) > 2048) { self.error = "motd must be at most 2048 bytes"; }
+    }
+
+    fn apply(key: str, value: str) -> void {
+        if (key == "server-ip") { self.address = value; }
+        if (key == "server-port") { self.port = to_i32(value); }
+        if (key == "motd") { self.motd = value; }
+        if (key == "max-players") { self.max_players = to_i32(value); }
+        if (key == "view-distance") { self.view = to_i32(value); }
+        if (key == "level-name" || key == "world-name") { self.world = value; }
+        if (key == "level-seed" || key == "seed") {
+            if (value == "") { self.seed = 0; }
+            else {
+                self.seed = to_i64(value);
+                if (!matches_seed(value, self.seed)) { self.error = "level-seed must be a signed 64-bit decimal number"; }
+            }
+        }
+        if (key == "vanilla-snapshot") { self.source = value; }
+        if (key == "online-mode" && value != "false") { self.error = "online-mode requires Mojang authentication and is unavailable"; }
+        if (key == "gamemode") {
+            if (value == "creative") { self.mode = 1; }
+            else if (value == "survival") { self.mode = 0; }
+            else { self.error = "gamemode must be creative or survival"; }
+        }
+        if (key == "difficulty") {
+            if (value == "peaceful") { self.difficulty = 0; }
+            else if (value == "easy") { self.difficulty = 1; }
+            else if (value == "normal") { self.difficulty = 2; }
+            else if (value == "hard") { self.difficulty = 3; }
+            else { self.error = "invalid difficulty"; }
+        }
+    }
+}
+
+fn matches_seed(text: str, seed: i64) -> bool {
+    let index: i32 = 0;
+    let negative: bool = starts_with(text, "-");
+    if (negative || starts_with(text, "+")) { index = 1; }
+    if (index >= len(text)) { return false; }
+    while (index < len(text) - 1 && byte_at(text, index) == 48) { index++; }
+    let digits: str = substr(text, index);
+    if (negative && digits != "0") { digits = "-" + digits; }
+    return to_str(seed) == digits;
+}

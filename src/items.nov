@@ -1,0 +1,84 @@
+module items;
+
+import ../lib/std;
+import ../lib/socket;
+import connection;
+import play;
+import wire;
+import world;
+
+class ItemDrop {
+    pub let id: i32;
+    pub let x: i32;
+    pub let y: i32;
+    pub let z: i32;
+    pub let item: i32;
+    pub let expires: i64;
+    pub let spawned: i64;
+
+    pub init(id: i32, x: i32, y: i32, z: i32, item: i32, now: i64) {
+        self.id = id;
+        self.x = x; self.y = y; self.z = z;
+        self.item = item;
+        self.spawned = now;
+        self.expires = now + 300000;
+    }
+
+    pub fn send(to: Connection) -> void {
+        let packet: Bytes = new Bytes();
+        packet.varint(self.id);
+        let uuid: str = offline_uuid("item:" + to_str(self.id));
+        packet.append(uuid, 0, 16);
+        packet.varint(71);
+        packet.double(i64_to_f64(to_i64(self.x)) + 0.5);
+        packet.double(i64_to_f64(to_i64(self.y)) + 0.15);
+        packet.double(i64_to_f64(to_i64(self.z)) + 0.5);
+        packet.byte(0); // velocity
+        packet.byte(0); packet.byte(0); packet.byte(0);
+        packet.varint(0);
+        to.send(1, packet);
+
+        let metadata: Bytes = new Bytes();
+        metadata.varint(self.id);
+        metadata.byte(5); metadata.varint(8); metadata.byte(1); // no gravity
+        metadata.byte(8); metadata.varint(7); // item stack entry
+        metadata.varint(1); metadata.varint(self.item); metadata.varint(0); metadata.varint(0);
+        metadata.byte(255);
+        to.send(97, metadata);
+    }
+
+    pub fn near(player: Connection) -> bool {
+        let dx: f64 = player.x - (i64_to_f64(to_i64(self.x)) + 0.5);
+        let dz: f64 = player.z - (i64_to_f64(to_i64(self.z)) + 0.5);
+        let dy: f64 = player.y - i64_to_f64(to_i64(self.y));
+        return dx * dx + dz * dz < 2.25 && dy >= -0.5 && dy <= 1.8;
+    }
+}
+
+fn take_item(level: World, player: Connection, item: i32) -> bool {
+    let limit: i32 = level.max_stack(item);
+    if (limit < 1) { return false; }
+    for (let index: i32 = 0; index < 36; index++) {
+        let slot: i32 = inventory_slot(index);
+        if (player.items[slot] == item && player.amounts[slot] < limit) {
+            player.amounts[slot]++;
+            send_inventory(player);
+            return true;
+        }
+    }
+    for (let index: i32 = 0; index < 36; index++) {
+        let slot: i32 = inventory_slot(index);
+        if (player.amounts[slot] == 0) {
+            player.items[slot] = item;
+            player.amounts[slot] = 1;
+            send_inventory(player);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn inventory_slot(index: i32) -> i32 {
+    if (index < 9) { return index + 36; }
+    return index;
+}

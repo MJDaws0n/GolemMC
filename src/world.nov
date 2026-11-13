@@ -1,61 +1,414 @@
-// ---------------------------------------------------------------------------
-// world.nov - world folder generation
-// creates the world directory and a basic level.dat style file
-// rn its pretty minimal but itll get the job done
-// we just need the folder to exist and have seed info basically
-// ---------------------------------------------------------------------------
-
 module world;
 
-import ../lib/std/main;
-import ../lib/file_io/main;
-import config;
+import ../lib/std;
+import ../lib/file_io;
+import ../lib/socket;
+import wire;
 
-// ---------------------------------------------------------------------------
-// create the world directory and seed file
-// ---------------------------------------------------------------------------
+fn block_floor(value: f64) -> i32 {
+    let rounded: i32 = to_i32(value);
+    if (value < i64_to_f64(to_i64(rounded))) { return rounded - 1; }
+    return rounded;
+}
 
-fn world_init() -> void {
-    let world_name: str = config_get_world_name();
+fn chunk_path(folder: str, x: i32, z: i32) -> str {
+    return folder + "/chunks/" + to_str(x) + "." + to_str(z) + ".bin";
+}
 
-    // try to create the world directory (0755 = 493)
-    let rc: i32 = sys_mkdir(world_name, 493);
+class BlockChange {
+    pub let x: i32;
+    pub let y: i32;
+    pub let z: i32;
+    pub let state: i32;
 
-    // check if the seed file already exists
-    let seed_path: str = world_name + "/seed.txt";
+    pub init(x: i32, y: i32, z: i32, state: i32) {
+        self.x = x; self.y = y; self.z = z; self.state = state;
+    }
+}
 
-    if (file_exists(seed_path)) {
-        // world already exists, we're good
-        log_info("loaded world '" + world_name + "'");
+class World {
+    pub let seed: i64;
+    pub let seed_hash: i64;
+    pub let flat: bool;
+    pub let spawn_x: i32 = 0;
+    pub let spawn_y: i32 = -60;
+    pub let spawn_z: i32 = 0;
+    pub let error: str = "";
+    let folder: str;
+    let lock: i32 = -1;
+    let source: str;
+    let changes: []BlockChange = [];
+    let dirty: bool = false;
+    let item_states: Bytes;
+    let item_limits: Bytes;
+    let block_rules: Bytes;
+
+    pub init(folder: str, source: str, seed: i64) {
+        self.folder = folder;
+        self.source = source;
+        self.seed = seed;
+        self.seed_hash = hash_seed(seed);
+        self.flat = source == "";
+        self.item_states = read_blob("data/item-block-states-774.bin", 16384);
+        self.item_limits = read_blob("data/item-limits-774.bin", 4096);
+        self.block_rules = read_blob("data/block-rules-774.bin", 262144);
+        if (self.item_states == null || self.item_limits == null || self.block_rules == null ||
+            self.item_states.size != self.item_limits.size * 4 || self.block_rules.size % 8 != 0) {
+            self.error = "Cannot load protocol 774 block and item registries"; return;
+        }
+        if (!self.flat) {
+            let meta: FileTextResult = read_all_text(source + "/snapshot.txt");
+            let fields: []str = string_split(str_trim(meta.data), " ");
+            if (meta.error != "" || len(fields) != 5 || fields[0] != "774" || fields[1] != to_str(seed)) {
+                self.error = "The snapshot must match protocol 774 and level-seed";
+                return;
+            }
+            self.spawn_x = to_i32(fields[2]);
+            self.spawn_y = to_i32(fields[3]);
+            self.spawn_z = to_i32(fields[4]);
+            if (!file_exists(chunk_path(source, self.spawn_x >> 4, self.spawn_z >> 4))) {
+                self.error = "The snapshot is missing its spawn chunk";
+                return;
+            }
+        }
+        self.error = create_directories(folder + "/players");
+        if (self.error != "") { return; }
+        self.lock = file_open(folder + "/.golem.lock", 514, 420); // O_CREAT | O_RDWR
+        if (self.lock < 0 || !lock_file(self.lock)) {
+            self.error = "Cannot lock world directory; it may already be in use";
+            return;
+        }
+        let rules_path: str = folder + "/golem-world.txt";
+        let rules: str = "774 " + to_str(seed) + " " + source + "\n";
+        if (file_exists(rules_path)) {
+            let existing: FileTextResult = read_all_text(rules_path);
+            if (existing.error != "" || existing.data != rules) { self.error = "The world directory belongs to a different seed or snapshot"; return; }
+        } else {
+            if (file_exists(folder + "/region/blocks.dat")) {
+                self.error = "This directory contains a legacy GolemMC world. Set level-name to a new directory.";
+                return;
+            }
+            self.error = write_all_text(rules_path, rules);
+            if (self.error != "") { return; }
+        }
+        self.load();
+    }
+
+    pub fn release() -> void { file_close(self.lock); }
+
+    pub fn max_stack(item: i32) -> i32 {
+        if (item <= 0 || item >= self.item_limits.size) { return 0; }
+        return byte_at(self.item_limits.data, item);
+    }
+
+    pub fn mining_time(state: i32) -> i32 {
+        if (state < 0 || state >= self.block_rules.size / 8) { return -1; }
+        let reader: Reader = new Reader(self.block_rules.data, state * 8, state * 8 + 4);
+        return reader.int32();
+    }
+
+    pub fn drop_item(state: i32) -> i32 {
+        if (state < 0 || state >= self.block_rules.size / 8) { return 0; }
+        let reader: Reader = new Reader(self.block_rules.data, state * 8 + 4, state * 8 + 8);
+        return reader.int32();
+    }
+
+    pub fn has_chunk(x: i32, z: i32) -> bool {
+        return self.flat || file_exists(chunk_path(self.source, x, z));
+    }
+
+    pub fn player_path(username: str) -> str { return self.folder + "/players/" + username + ".bin"; }
+
+    pub fn block_for_item(item: i32) -> i32 {
+        if (item <= 0 || item >= self.item_states.size / 4) { return -1; }
+        let reader: Reader = new Reader(self.item_states.data, item * 4, item * 4 + 4);
+        return reader.int32();
+    }
+
+    pub fn block(x: i32, y: i32, z: i32) -> i32 {
+        if (y < -64 || y > 319) { return 0; }
+        for (let index: i32 = 0; index < len(self.changes); index++) {
+            let change: BlockChange = self.changes[index];
+            if (change.x == x && change.y == y && change.z == z) { return change.state; }
+        }
+        if (self.flat) {
+            if (y == -64) { return 85; }
+            if (y == -63 || y == -62) { return 10; }
+            if (y == -61) { return 9; }
+            return 0;
+        }
+        let source: Bytes = read_blob(chunk_path(self.source, x >> 4, z >> 4), 2097151);
+        if (source == null) { return -1; }
+        return read_block(source, x, y, z);
+    }
+
+    pub fn set_block(x: i32, y: i32, z: i32, state: i32) -> bool {
+        if (y < -64 || y > 319 || x < -29999984 || x > 29999984 || z < -29999984 || z > 29999984) { return false; }
+        if (!self.has_chunk(x >> 4, z >> 4)) { return false; }
+        for (let index: i32 = 0; index < len(self.changes); index++) {
+            let change: BlockChange = self.changes[index];
+            if (change.x == x && change.y == y && change.z == z) {
+                if (change.state != state) { change.state = state; self.dirty = true; }
+                return true;
+            }
+        }
+        if (len(self.changes) >= 1048575) { return false; }
+        array_append(self.changes, new BlockChange(x, y, z, state));
+        self.dirty = true;
+        return true;
+    }
+
+    fn load() -> void {
+        let path: str = self.folder + "/blocks-774.bin";
+        if (!file_exists(path)) { return; }
+        let data: Bytes = read_blob(path, 16777216);
+        if (data == null || data.size < 4 || (data.size - 4) % 16 != 0) {
+            self.error = "Invalid block save"; return;
+        }
+        let reader: Reader = new Reader(data.data, 0, data.size);
+        if (reader.int32() != 1196245810) { self.error = "Unknown block save format"; return; }
+        while (reader.left() > 0) {
+            let x: i32 = reader.int32(); let y: i32 = reader.int32();
+            let z: i32 = reader.int32(); let state: i32 = reader.int32();
+            if (state < 0 || state >= self.block_rules.size / 8 || y < -64 || y > 319) { self.error = "Invalid block save record"; return; }
+            array_append(self.changes, new BlockChange(x, y, z, state));
+        }
+    }
+
+    pub fn save() -> bool {
+        if (!self.dirty) { return true; }
+        let data: Bytes = new Bytes(4 + len(self.changes) * 16);
+        data.int32(1196245810);
+        for (let index: i32 = 0; index < len(self.changes); index++) {
+            let change: BlockChange = self.changes[index];
+            data.int32(change.x); data.int32(change.y); data.int32(change.z); data.int32(change.state);
+        }
+        if (!write_blob(self.folder + "/blocks-774.bin", data)) { return false; }
+        self.dirty = false;
+        return true;
+    }
+
+    pub fn chunk(x: i32, z: i32) -> Bytes {
+        let original: Bytes = null;
+        if (self.flat) { original = flat_chunk(x, z); }
+        else { original = read_blob(chunk_path(self.source, x, z), 2097151); }
+        if (original == null) { return null; }
+        let edits: []BlockChange = [];
+        for (let index: i32 = 0; index < len(self.changes); index++) {
+            let change: BlockChange = self.changes[index];
+            if (change.x >> 4 == x && change.z >> 4 == z) { array_append(edits, change); }
+        }
+        if (len(edits) == 0) { return original; }
+        return apply_edits(original, edits);
+    }
+}
+
+fn flat_chunk(x: i32, z: i32) -> Bytes {
+    let sections: Bytes = new Bytes(2400);
+    sections.short(1024);
+    sections.byte(4);
+    sections.varint(4); sections.varint(85); sections.varint(10); sections.varint(9); sections.varint(0);
+    for (let index: i32 = 0; index < 256; index++) {
+        let packed: i64 = 3689348814741910323;
+        if (index < 16) { packed = 0; }
+        else if (index < 48) { packed = 1229782938247303441; }
+        else if (index < 64) { packed = 2459565876494606882; }
+        sections.long(packed);
+    }
+    sections.byte(0); sections.varint(40); // plains, vanilla registry order
+    for (let index: i32 = 1; index < 24; index++) {
+        sections.short(0);
+        sections.byte(0); sections.varint(0);
+        sections.byte(0); sections.varint(40);
+    }
+    let result: Bytes = new Bytes(6000);
+    result.int32(x); result.int32(z);
+    let map_types: []i32 = [4, 1, 5];
+    result.varint(len(map_types));
+    for (let index: i32 = 0; index < len(map_types); index++) {
+        result.varint(map_types[index]);
+        result.varint(37);
+        for (let packed: i32 = 0; packed < 37; packed++) {
+            let value: i64 = 0;
+            for (let offset: i32 = 0; offset < 7 && packed * 7 + offset < 256; offset++) {
+                value |= to_i64(4) << to_i64(offset * 9);
+            }
+            result.long(value);
+        }
+    }
+    result.varint(sections.size);
+    result.append(sections.data, 0, sections.size);
+    result.varint(0); // block entities
+    result.varint(1); result.long(6); // bottom two lit sections, matching vanilla flat
+    result.varint(0); // block light
+    result.varint(1); result.long(1); // no sky light below the world
+    result.varint(1); result.long(7); // no emitted block light in initialized sections
+    result.varint(2);
+    let sky: str = alloc_string(2048);
+    memset(ptr(sky), 255, 2048);
+    memset(ptr(sky), 0, 512);
+    result.varint(2048); result.append(sky, 0, 2048);
+    memset(ptr(sky), 255, 512);
+    result.varint(2048); result.append(sky, 0, 2048);
+    result.varint(0);
+    return result;
+}
+
+fn palette_count(bits: i32, entries: i32) -> i32 {
+    let per_word: i32 = 64 / bits;
+    return (entries + per_word - 1) / per_word;
+}
+
+fn read_palette(reader: Reader, entries: i32, indirect_max: i32, block_states: []i32, decode: bool) -> void {
+    let bits: i32 = reader.byte();
+    if (bits == 0) {
+        let value: i32 = reader.varint();
+        if (decode) {
+            for (let index: i32 = 0; index < entries; index++) { array_append(block_states, value); }
+        }
         return;
     }
-
-    // new world - write the seed file
-    log_info("generating new world '" + world_name + "'...");
-
-    let seed: str = config_get_seed();
-    let sfd: i32 = file_open_write(seed_path);
-    if (sfd >= 0) {
-        file_write_str(sfd, seed + "\n");
-        file_close(sfd);
+    if (bits > 16) { reader.valid = false; return; }
+    let palette: []i32 = [];
+    if (bits <= indirect_max) {
+        let size: i32 = reader.varint();
+        if (!reader.valid || size < 1 || size > (1 << bits)) { reader.valid = false; return; }
+        for (let index: i32 = 0; index < size; index++) { array_append(palette, reader.varint()); }
     }
-
-    // create region directory for future chunk storage
-    sys_mkdir(world_name + "/region", 493);
-
-    // write a basic level info file
-    let level_path: str = world_name + "/level.txt";
-    let lfd: i32 = file_open_write(level_path);
-    if (lfd >= 0) {
-        file_write_str(lfd, "# GolemMC World Data\n");
-        file_write_str(lfd, "seed=" + seed + "\n");
-        file_write_str(lfd, "gamemode=" + config_get_gamemode() + "\n");
-        file_write_str(lfd, "difficulty=" + config_get_difficulty() + "\n");
-        file_write_str(lfd, "spawn-x=0\n");
-        file_write_str(lfd, "spawn-y=64\n");
-        file_write_str(lfd, "spawn-z=0\n");
-        file_close(lfd);
+    let words: i32 = palette_count(bits, entries);
+    if (!decode) { reader.skip(words * 8); return; }
+    let per_word: i32 = 64 / bits;
+    let mask: u64 = (to_u64(1) << to_u64(bits)) - 1;
+    for (let word: i32 = 0; word < words; word++) {
+        let packed: u64 = to_u64(reader.long());
+        for (let index: i32 = 0; index < per_word && len(block_states) < entries; index++) {
+            let value: i32 = to_i32(packed & mask);
+            if (bits <= indirect_max) {
+                if (value >= len(palette)) { reader.valid = false; return; }
+                value = palette[value];
+            }
+            array_append(block_states, value);
+            packed >>= to_u64(bits);
+        }
     }
+}
 
-    log_info("world '" + world_name + "' created with seed: " + seed);
+fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
+    let reader: Reader = new Reader(chunk.data, 0, chunk.size);
+    if (!skip_heightmaps(reader)) { return null; }
+    let header: i32 = reader.offset;
+    let sections_length: i32 = reader.varint();
+    if (!reader.valid || sections_length < 0 || sections_length > reader.left()) { return null; }
+    let tail: i32 = reader.offset + sections_length;
+    reader.end = tail;
+    let sections: Bytes = new Bytes(sections_length);
+    for (let section: i32 = 0; section < 24; section++) {
+        let start: i32 = reader.offset;
+        let decode: bool = false;
+        for (let index: i32 = 0; index < len(edits); index++) {
+            if ((edits[index].y + 64) >> 4 == section) { decode = true; break; }
+        }
+        reader.short();
+        let states: []i32 = [];
+        read_palette(reader, 4096, 8, states, decode);
+        let biome_start: i32 = reader.offset;
+        read_palette(reader, 64, 3, [], false);
+        if (!reader.valid) { return null; }
+        if (!decode) {
+            sections.append(chunk.data, start, reader.offset - start);
+        } else {
+            for (let edit: i32 = 0; edit < len(edits); edit++) {
+                let change: BlockChange = edits[edit];
+                if ((change.y + 64) >> 4 == section) {
+                    states[((change.y & 15) << 8) | ((change.z & 15) << 4) | (change.x & 15)] = change.state;
+                }
+            }
+            let non_air: i32 = 0;
+            for (let index: i32 = 0; index < 4096; index++) {
+                let state: i32 = states[index];
+                if (state != 0 && state != 15090 && state != 15091) { non_air++; }
+            }
+            sections.short(non_air);
+            sections.byte(15);
+            for (let word: i32 = 0; word < 1024; word++) {
+                let packed: i64 = 0;
+                for (let index: i32 = 0; index < 4; index++) {
+                    packed |= to_i64(states[word * 4 + index]) << to_i64(index * 15);
+                }
+                sections.long(packed);
+            }
+            sections.append(chunk.data, biome_start, reader.offset - biome_start);
+        }
+    }
+    if (reader.offset != tail) { return null; }
+    let result: Bytes = new Bytes(chunk.size + sections.size - sections_length);
+    result.append(chunk.data, 0, header);
+    result.varint(sections.size);
+    result.append(sections.data, 0, sections.size);
+    if (!append_edited_entities(result, chunk, tail, edits)) { return null; }
+    return result;
+}
+
+fn skip_heightmaps(reader: Reader) -> bool {
+    reader.skip(8);
+    let maps: i32 = reader.varint();
+    if (!reader.valid || maps < 0 || maps > 6) { return false; }
+    for (let index: i32 = 0; index < maps; index++) {
+        reader.varint();
+        let longs: i32 = reader.varint();
+        if (longs < 0 || longs > 37) { return false; }
+        reader.skip(longs * 8);
+    }
+    return reader.valid;
+}
+
+fn read_block(chunk: Bytes, x: i32, y: i32, z: i32) -> i32 {
+    let reader: Reader = new Reader(chunk.data, 0, chunk.size);
+    if (!skip_heightmaps(reader)) { return -1; }
+    let sections: i32 = reader.varint();
+    if (sections < 0 || sections > reader.left()) { return -1; }
+    reader.end = reader.offset + sections;
+    let wanted: i32 = (y + 64) >> 4;
+    let states: []i32 = [];
+    for (let section: i32 = 0; section <= wanted; section++) {
+        reader.short();
+        read_palette(reader, 4096, 8, states, section == wanted);
+        if (section < wanted) { read_palette(reader, 64, 3, [], false); }
+        if (!reader.valid) { return -1; }
+    }
+    return states[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+}
+
+fn append_edited_entities(result: Bytes, original: Bytes, tail: i32, edits: []BlockChange) -> bool {
+    let reader: Reader = new Reader(original.data, tail, original.size);
+    let total: i32 = reader.varint();
+    if (!reader.valid || total < 0 || total > 98304) { return false; }
+    let entries: Bytes = new Bytes();
+    let kept: i32 = 0;
+    for (let index: i32 = 0; index < total; index++) {
+        let start: i32 = reader.offset;
+        let packed: i32 = reader.byte();
+        let y: i32 = reader.short();
+        if (y >= 32768) { y -= 65536; }
+        reader.varint();
+        let tag: i32 = reader.byte();
+        skip_nbt(reader, tag, 0);
+        if (!reader.valid) { return false; }
+        let removed: bool = false;
+        for (let edit: i32 = 0; edit < len(edits); edit++) {
+            let change: BlockChange = edits[edit];
+            if ((change.x & 15) == packed >> 4 && change.y == y && (change.z & 15) == (packed & 15)) {
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) {
+            entries.append(original.data, start, reader.offset - start);
+            kept++;
+        }
+    }
+    result.varint(kept);
+    result.append(entries.data, 0, entries.size);
+    result.append(original.data, reader.offset, reader.left());
+    return true;
 }

@@ -1,101 +1,66 @@
 # GolemMC
 
-A Minecraft server. Not written in Java. Written in [Novus](https://github.com/MJDaws0n/Novus).
+A native Novus server for Minecraft Java Edition 1.21.11, protocol 774. The rewrite uses Novus classes for connections, packets, worlds and gameplay. The GolemMC application and its socket library use no inline assembly. The socket library calls macOS system APIs through Novus `native_call`.
 
-## implementation status
+## Build and run
 
-| feature | status | notes |
-|---|---|---|
-| server list ping (SLP) | ✅ done | shows up in MC server list with motd, version, player count |
-| config file generation | ✅ done | server.properties with all the usual settings |
-| world folder creation | ✅ done | creates world dir with seed file |
-| console commands | ✅ done | help, stop, status, seed, version, list |
-| non-blocking console I/O | ✅ done | type commands while server runs |
-| debug mode (--debug) | ✅ done | extra logging for when stuff breaks |
-| player login (offline mode) | ✅ done | login sequence, UUID generation from username |
-| configuration phase | ✅ done | sends registry data (dimensions, biomes, chat types etc) |
-| play state - join world | ✅ done | login play, spawn position, player position |
-| flat world chunk generation | ✅ done | stone + grass flat world, 7x7 chunk grid |
-| terrain generation (perlin noise) | ✅ done | hills, caves, ores, bedrock, proper block layers |
-| keep alive packets | ✅ done | keeps connection alive every ~20s |
-| SIGPIPE handling | ✅ done | server doesnt crash when players disconnect |
-| player join/leave messages | ✅ done | console + future chat output |
-| multi-player support | ❌ todo | currently single player only |
-| player movement sync | ❌ todo | broadcasting position to other players |
-| chat system | ❌ todo | player-to-player messaging |
-| block breaking | ✅ done | creative instant-break + survival digging |
-| block placing | ✅ done | click-to-place (always stone for now, no inventory) |
-| PvP (hitting players) | ❌ todo | damage + knockback |
-| item drops | ❌ todo | entities when blocks break |
-| item pickup | ❌ todo | walking over dropped items |
-| inventory management | ❌ todo | proper slot tracking |
-| world persistence | ✅ done | block changes saved to world/region/blocks.dat |
-| player data persistence | ❌ todo | save position, inventory, health |
-| terrain generation | ✅ done | perlin noise terrain with hills, caves, ores |
-| mob spawning | ❌ todo | passive + hostile mobs |
-| day/night cycle | ❌ todo | time packets |
-| weather | ❌ todo | rain and thunder |
-| crafting | ❌ todo | crafting table + recipes |
-| furnace / smelting | ❌ todo | furnace block entity |
-| redstone | ❌ todo | signal propagation |
-| command blocks | ❌ todo | programmable commands |
-| enchanting | ❌ todo | enchantment table |
-| villager trading | ❌ todo | villager AI + trades |
-| the nether | ❌ todo | dimension switching |
-| the end | ❌ todo | ender dragon + end dimension |
-| online mode (auth) | ❌ todo | mojang authentication + encryption |
-| compression | ❌ todo | zlib packet compression |
-| RCON | ❌ todo | remote console |
+The verified host is Apple Silicon macOS. Install the Xcode Command Line Tools and use the self-hosted Novus checkout with `native_call`, bitwise compound assignments and the address-of type fix. The rewrite was verified with Novus commit `21177fb` on the local `feature/golemmc-native-apis` branch. Build that checkout before building GolemMC.
 
-## how to build & run
-Install [novus](https://github.com/mjdaws0n/novus) and [nox](https://github.com/mjdaws0n/nox).
-
-```bash
-# Add libraries
-nox init
-
-# compile it
-novus main.nov
-
-# Sign the binary if you want
-codesign -s - --force build/darwin_arm64/GolemMC
-
-# run it (default port 25565)
+```sh
+export NOVUS_ROOT=/path/to/Novus/compiler
+./tools/build.sh
 ./build/darwin_arm64/GolemMC
-
-# run with debug logging
-./build/darwin_arm64/GolemMC --debug
 ```
 
-Then add `localhost:25565` to your Minecraft server list and watch it appear.
+Set `NOVUS_BIN` to use a specific compiler binary. The build uses the compiler checkout's current `std` and `file_io` libraries. Run from the GolemMC checkout so it can find the protocol registries in `data/`. The executable also accepts a path to a properties file as its sole argument.
 
-## console commands
+On first run GolemMC generates `server.properties` with a loopback listener on port 25565, creative mode, a flat world and a view distance of 3. Use `127.0.0.1:25565` in the 1.21.11 client. The server uses offline usernames, so the loopback default keeps the world private to this machine. Stop with the console command `stop` to flush saves.
 
-Once the server is running you can type these into the console:
-- `help` - show available commands
-- `stop` - stop the server
-- `save` - save world data to disk
-- `status` - show server status (port, motd, players)
-- `seed` - show the world seed
-- `version` - show server version
-- `list` - show connected players
+| In-game | Console |
+| --- | --- |
+| `/help`, `/list`, `/seed`, `/spawn` | `help`, `list`, `seed`, `save`, `say <message>`, `stop` |
 
-## config
+## World modes
 
-The `server.properties` file gets auto-generated on first run. You can edit it to change:
-- `server-port` - port to listen on (default 25565)
-- `motd` - the message that shows in the server list
-- `max-players` - max player count shown in server list
-- `world-name` - name of the world folder
-- `seed` - world seed (randomly generated if not set)
-- `gamemode` - survival/creative/adventure/spectator
-- `difficulty` - peaceful/easy/normal/hard
-- `view-distance` - how far players can see (in chunks)
-- `online-mode` - whether to verify players with Mojang
+- **Native flat.** GolemMC generates vanilla's default Overworld flat layers from bedrock through grass. The integration suite compares 98,304 block positions, biomes, heightmaps and lighting against a chunk from Mojang's server.
+- **Vanilla snapshot.** Supply `vanilla-snapshot` and the matching numeric `level-seed` to serve captured Overworld chunks without Java at runtime. An unedited chunk is sent byte for byte, preserving vanilla's blocks, biomes, structures, heightmaps, block entity data and light. Players stay inside the captured area. This mode does not generate new vanilla terrain.
 
-## requirements
+To capture a snapshot, run a private headless vanilla **1.21.11** server with a fresh world, the desired numeric `level-seed`, `online-mode=false`, `enforce-secure-profile=false` and `view-distance` at least one greater than the radius being captured. Use Docker if the host lacks Java 21. The capture tool checks the seed against the server's reported hash.
 
-- macOS on Apple Silicon (M1/M2/M3/M4) (Windows may work, only tested on macos)
-- The [Novus compiler](https://github.com/mjdaws0n/novus) (included as `novus` binary)
-- The [Nox package manager](https://github.com/mjdaws0n/nox) (included as `nox` binary)
-- Minecraft Java Edition 1.21.11 (to actually connect)
+```sh
+npm ci --prefix tools
+mkdir -p run
+node tools/capture-vanilla.cjs run/my-snapshot 25566 5241482691752223138 2
+```
+
+Set the following in GolemMC's properties file and restart. Use a fresh `level-name` when switching between seeds or world modes.
+
+```properties
+level-name=world
+level-seed=5241482691752223138
+vanilla-snapshot=run/my-snapshot
+view-distance=2
+```
+
+GolemMC stores overlays and player saves separately. The legacy `region/blocks.dat` format used an incompatible terrain baseline and is not loaded automatically.
+
+## What the rewrite supports
+
+Server-list status, offline login, vanilla configuration registries, concurrent players, movement and presence updates, chat, view-based chunk streaming, day/night, creative block inventory and edits, basic timed survival mining, drop pickup and item consumption on placement, manual 2×2 inventory crafting, and persisted block edits, player location and inventory.
+
+The survival implementation is partial. Native seeded Overworld terrain, Nether and End travel, authentic account login, compression, mobs, combat, collisions and survival damage, crafting tables and recipe-book interactions, smelting, other container interactions, weather, vanilla item and block rules, and relighting after edits still need implementation. Edited chunks preserve the original lighting and heightmaps. Redstone and the full command set are outside this rewrite's current scope.
+
+## Verification
+
+```sh
+./tools/build.sh tests/socket.nov
+./build/darwin_arm64/socket_tests
+./tools/build.sh tests/wire.nov
+./build/darwin_arm64/wire_tests
+npm ci --prefix tools
+npm test --prefix tools
+```
+
+The integration suite uses headless protocol clients. Set `GOLEM_SNAPSHOT` to a vanilla Overworld capture to compare immutable chunk payloads byte for byte. Set `GOLEM_FLAT_SNAPSHOT` to a flat vanilla capture containing chunk `0.0` to compare decoded blocks, biomes and lighting against GolemMC's native flat generator.
+
+`data/configuration-774.bin` contains the vanilla 1.21.11 registry, tags and feature-flag frames obtained during configuration. The other protocol data files are generated by `node tools/registry-data.cjs` using the pinned [PrismarineJS Minecraft data](https://github.com/PrismarineJS/minecraft-data) package. The pinned reference client and decoder are dev dependencies.

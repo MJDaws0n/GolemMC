@@ -1,0 +1,568 @@
+module server;
+
+import ../lib/std;
+import ../lib/file_io;
+import ../lib/socket;
+import settings;
+import wire;
+import connection;
+import world;
+import play;
+import items;
+import crafting;
+
+class Server {
+    let settings: Settings;
+    let world: World;
+    let configuration: Bytes;
+    let players: []Connection = [];
+    let drops: []ItemDrop = [];
+    let crafting: Crafting = new Crafting();
+    let poller: PollSet = new PollSet(129);
+    let next_id: i32 = 1;
+    let running: bool = true;
+    let input_open: bool = true;
+    let console: str = "";
+    let started: i64;
+    let updated: i64;
+    let saved: i64;
+    pub let error: str = "";
+
+    pub init(options: Settings) {
+        self.settings = options;
+        if (!self.crafting.ready) { self.error = "Cannot load crafting recipes"; return; }
+        self.configuration = read_blob("data/configuration-774.bin", 1048576);
+        if (self.configuration == null) { self.error = "Cannot load protocol 774 registries. Run from the GolemMC checkout."; return; }
+        self.world = new World(options.world, options.source, options.seed);
+        self.error = self.world.error;
+    }
+
+    pub fn run() -> i32 {
+        let listener: i32 = socket_listener(self.settings.address, self.settings.port);
+        if (listener < 0) {
+            print("Could not listen on " + self.settings.address + ":" + to_str(self.settings.port));
+            return 1;
+        }
+        self.started = monotonic_ms();
+        self.updated = self.started;
+        self.saved = self.started;
+        print("GolemMC 1.21.11 is listening on " + self.settings.address + ":" + to_str(self.settings.port));
+        while (self.running) { self.step(listener); }
+        let all_saved: bool = true;
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let player: Connection = self.players[index];
+            if (player.phase == 6 && !save_player(self.world, player)) { all_saved = false; }
+            socket_close(player.fd);
+        }
+        socket_close(listener);
+        if (!self.world.save()) { print("Failed to save world"); all_saved = false; }
+        self.world.release();
+        if (!all_saved) { return 1; }
+        return 0;
+    }
+
+    fn step(listener: i32) -> void {
+        self.poller.clear();
+        self.poller.add(listener, 1);
+        if (self.input_open) { self.poller.add(0, 1); }
+        else { self.poller.add(-1, 1); }
+        let count: i32 = len(self.players);
+        for (let index: i32 = 0; index < count; index++) {
+            let flags: i32 = 1;
+            if (self.players[index].waiting() > 0) { flags |= 4; }
+            self.poller.add(self.players[index].fd, flags);
+        }
+        let ready: i32 = self.poller.wait(20);
+        let now: i64 = monotonic_ms();
+        let ticks: i64 = (now - self.started) / 50;
+        if (ready > 0 && (self.poller.events(1) & 25) != 0) { self.read_console(); }
+        for (let index: i32 = 0; index < count; index++) {
+            let player: Connection = self.players[index];
+            let events: i32 = 0;
+            if (ready > 0) { events = self.poller.events(index + 2); }
+            if ((events & 40) != 0) { player.abort(); }
+            if (!player.done && (events & 17) != 0) {
+                if (!player.receive(now)) { player.abort(); }
+            }
+            if (!player.closing && (events & 1) != 0) {
+                let frame: Reader = player.packet();
+                while (frame != null && !player.closing) {
+                    self.handle(player, frame, now, ticks);
+                    if (!frame.valid) { player.closing = true; }
+                    if (!player.closing) { frame = player.packet(); }
+                }
+            }
+            if (!player.closing && now - player.touched > 30000) { player.closing = true; }
+            if (!player.closing && player.phase == 6) {
+                self.tick_player(player, now, ticks);
+            }
+            if (player.closing && player.close_deadline == 0) { player.close_deadline = now + 1000; }
+            if ((player.closing && now >= player.close_deadline) || !player.flush()) { player.abort(); }
+            if (player.closing && !player.done && !player.finished_writing && player.waiting() == 0) {
+                socket_shutdown_write(player.fd);
+                player.finished_writing = true;
+            }
+        }
+        self.tick_drops(now);
+        if (now - self.updated >= 1000) { self.updated = now; }
+        if (now - self.saved >= 30000) {
+            if (!self.world.save()) { print("Failed to save world"); }
+            for (let index: i32 = 0; index < count; index++) {
+                let player: Connection = self.players[index];
+                if (player.phase == 6 && !player.closing) { save_player(self.world, player); }
+            }
+            self.saved = now;
+        }
+        self.remove_closed();
+        if (ready > 0 && (self.poller.events(0) & 1) != 0) {
+            let accepted: i32 = socket_accept(listener);
+            if (accepted >= 0) {
+                if (len(self.players) >= 127) { socket_close(accepted); }
+                else { array_append(self.players, new Connection(accepted, now)); }
+            }
+        }
+    }
+
+    fn tick_player(player: Connection, now: i64, ticks: i64) -> void {
+        if (player.keepalive != 0 && now - player.keepalive > 30000) {
+            player.closing = true;
+            return;
+        }
+        if (player.keepalive == 0 && now - player.last_keepalive > 10000) {
+            let packet: Bytes = new Bytes();
+            player.keepalive = now;
+            player.last_keepalive = now;
+            packet.long(now);
+            player.send(43, packet);
+        }
+        if (now - self.updated >= 1000) { send_time(player, ticks); }
+        stream_chunks(player, self.world, self.settings.view, now);
+    }
+
+    fn player_count() -> i32 {
+        let total: i32 = 0;
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            if (self.players[index].phase >= 3 && self.players[index].phase <= 6 && !self.players[index].closing) { total++; }
+        }
+        return total;
+    }
+
+    fn play_count() -> i32 {
+        let total: i32 = 0;
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            if (self.players[index].phase == 6 && !self.players[index].closing) { total++; }
+        }
+        return total;
+    }
+
+    fn handle(player: Connection, frame: Reader, now: i64, ticks: i64) -> void {
+        let id: i32 = frame.varint();
+        if (!frame.valid) { return; }
+        if (player.phase == 0) {
+            if (id != 0) { player.closing = true; return; }
+            player.protocol = frame.varint();
+            frame.string(255);
+            frame.short();
+            let request: i32 = frame.varint();
+            if (frame.left() != 0 || (request != 1 && request != 2)) { player.closing = true; return; }
+            player.phase = request;
+        } else if (player.phase == 1) {
+            self.status(player, frame, id);
+        } else if (player.phase == 2) {
+            if (id != 0) { player.closing = true; return; }
+            self.login(player, frame);
+        } else if (player.phase == 3) {
+            if (id != 3 || frame.left() != 0) { player.closing = true; return; }
+            let packs: Bytes = new Bytes();
+            packs.varint(0); // request full registry NBT instead of client core-pack lookup
+            player.send(14, packs);
+            player.phase = 4;
+        } else if (player.phase == 4) {
+            if (id == 7) {
+                if (frame.varint() != 0 || frame.left() != 0) { player.closing = true; return; }
+                player.send_raw(self.configuration);
+                player.send(3, new Bytes());
+                player.phase = 5;
+            }
+        } else if (player.phase == 5) {
+            if (id == 3 && frame.left() == 0) { self.join(player, now, ticks); }
+        } else if (player.phase == 6) {
+            self.play(player, frame, id, now);
+        }
+    }
+
+    fn status(player: Connection, frame: Reader, id: i32) -> void {
+        let response: Bytes = new Bytes();
+        if (id == 0 && frame.left() == 0) {
+            response.string("{\"version\":{\"name\":\"1.21.11\",\"protocol\":774}," +
+                "\"players\":{\"max\":" + to_str(self.settings.max_players) + ",\"online\":" +
+                to_str(self.play_count()) + ",\"sample\":[]}," +
+                "\"description\":{\"text\":" + json_string(self.settings.motd) + "},\"enforcesSecureChat\":false}");
+            player.send(0, response);
+        } else if (id == 1 && frame.left() == 8) {
+            response.long(frame.long());
+            player.send(1, response);
+            player.closing = true;
+        } else {
+            player.closing = true;
+        }
+    }
+
+    fn login(player: Connection, frame: Reader) -> void {
+        let name: str = frame.string(16);
+        frame.skip(16);
+        if (!frame.valid || frame.left() != 0) { player.closing = true; return; }
+        let rejection: str = "";
+        if (player.protocol != 774) { rejection = "GolemMC requires Minecraft Java 1.21.11"; }
+        else if (!valid_name(name)) { rejection = "Invalid username"; }
+        else if (self.player_count() >= self.settings.max_players) { rejection = "Server is full"; }
+        else {
+            for (let index: i32 = 0; index < len(self.players); index++) {
+                let other: Connection = self.players[index];
+                if (other.username != "" && str_lower(name) == str_lower(other.username)) {
+                    rejection = "That username is already connected";
+                    break;
+                }
+            }
+        }
+        let response: Bytes = new Bytes();
+        if (rejection != "") {
+            response.string("{\"text\":" + json_string(rejection) + "}");
+            player.send(0, response);
+            player.closing = true;
+            return;
+        }
+        player.username = name;
+        player.uuid = offline_uuid(name);
+        player.id = self.next_id;
+        self.next_id++;
+        player.phase = 3;
+        response.append(player.uuid, 0, 16);
+        response.string(name);
+        response.varint(0);
+        player.send(2, response);
+    }
+
+    fn join(player: Connection, now: i64, ticks: i64) -> void {
+        player.phase = 6;
+        player.last_keepalive = now;
+        player.x = i64_to_f64(to_i64(self.world.spawn_x)) + 0.5;
+        player.y = i64_to_f64(to_i64(self.world.spawn_y));
+        player.z = i64_to_f64(to_i64(self.world.spawn_z)) + 0.5;
+        for (let slot: i32 = 0; slot < 46; slot++) {
+            array_append(player.items, 0);
+            array_append(player.amounts, 0);
+        }
+        load_player(self.world, player);
+        self.crafting.update(player);
+        join_play(player, self.settings, self.world, ticks);
+        player_info(player, player, self.settings.mode);
+        center_view(player, block_floor(player.x) >> 4, block_floor(player.z) >> 4, self.settings.view, true);
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let other: Connection = self.players[index];
+            if (other == player || other.phase != 6 || other.closing) { continue; }
+            player_info(other, player, self.settings.mode);
+            player_info(player, other, self.settings.mode);
+            spawn_player(other, player);
+            spawn_player(player, other);
+        }
+        for (let index: i32 = 0; index < len(self.drops); index++) { self.drops[index].send(player); }
+        self.broadcast(player.username + " joined the game");
+        print(player.username + " joined the game");
+    }
+
+    fn remove_closed() -> void {
+        let kept: []Connection = [];
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let player: Connection = self.players[index];
+            if (!player.done) { array_append(kept, player); continue; }
+            if (player.phase == 6) {
+                save_player(self.world, player);
+                for (let other_index: i32 = 0; other_index < len(self.players); other_index++) {
+                    let other: Connection = self.players[other_index];
+                    if (!other.closing && other.phase == 6) { remove_player(other, player); }
+                }
+                self.broadcast(player.username + " left the game");
+                print(player.username + " left the game");
+            }
+            socket_close(player.fd);
+        }
+        self.players = kept;
+    }
+
+    fn play(player: Connection, frame: Reader, id: i32, now: i64) -> void {
+        if (id == 0) {
+            let sequence: i32 = frame.varint();
+            if (frame.valid && frame.left() == 0 && sequence == player.teleport) { player.teleport_pending = false; }
+        } else if (id == 10) {
+            frame.int32(); // requested chunk rate
+            if (frame.valid && frame.left() == 0) { player.next_batch = now; }
+        } else if (id == 27) {
+            let reply: i64 = frame.long();
+            if (frame.valid && frame.left() == 0 && reply == player.keepalive) { player.keepalive = 0; }
+        } else if (id == 29 || id == 30 || id == 31 || id == 32) {
+            if (!player.teleport_pending) { self.move(player, frame, id); }
+        } else if (id == 8) {
+            let message: str = frame.string(256);
+            if (frame.valid && printable(message)) { self.broadcast("<" + player.username + "> " + message); }
+        } else if (id == 6 || id == 7) {
+            let command: str = frame.string(256);
+            if (frame.valid) { self.command(command, player); }
+        } else if (id == 17) {
+            self.crafting.click(self.world, player, frame);
+        } else if (id == 52) {
+            let slot: i32 = frame.short();
+            if (slot >= 0 && slot < 9) { player.selected = slot; }
+        } else if (id == 55 && self.settings.mode == 1) {
+            self.creative_slot(player, frame);
+        } else if (id == 40 || id == 63) {
+            self.edit(player, frame, id, now);
+        }
+    }
+
+    fn move(player: Connection, frame: Reader, id: i32) -> void {
+        let x: f64 = player.x;
+        let y: f64 = player.y;
+        let z: f64 = player.z;
+        if (id == 29 || id == 30) {
+            x = frame.double(); y = frame.double(); z = frame.double();
+        }
+        if (id == 30 || id == 31) {
+            player.yaw_bits = frame.int32(); player.pitch_bits = frame.int32();
+        }
+        let flags: i32 = frame.byte();
+        if (!frame.valid || frame.left() != 0) { return; }
+        if (!valid_location(x, y, z)) { send_teleport(player); return; }
+        let cx: i32 = block_floor(x) >> 4;
+        let cz: i32 = block_floor(z) >> 4;
+        if ((cx != player.view_x || cz != player.view_z) && !self.world.has_chunk(cx, cz)) {
+            send_teleport(player);
+            return;
+        }
+        player.x = x; player.y = y; player.z = z; player.ground = (flags & 1) != 0;
+        center_view(player, cx, cz, self.settings.view, false);
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let other: Connection = self.players[index];
+            if (other != player && other.phase == 6 && !other.closing) { sync_player(other, player); }
+        }
+    }
+
+    fn creative_slot(player: Connection, frame: Reader) -> void {
+        let slot: i32 = frame.short();
+        let amount: i32 = frame.varint();
+        if (!frame.valid || slot < 1 || slot >= 46 || amount < 0 || amount > 99) { return; }
+        if (amount == 0 && frame.left() == 0) {
+            player.items[slot] = 0;
+            player.amounts[slot] = 0;
+            if (slot <= 4) { self.crafting.update(player); send_inventory(player); }
+            return;
+        }
+        if (amount == 0) { return; }
+        let item: i32 = frame.varint();
+        let added: i32 = frame.varint();
+        let removed: i32 = frame.varint();
+        if (!frame.valid || amount > self.world.max_stack(item) || added != 0 || removed != 0 || frame.left() != 0) { return; }
+        player.items[slot] = item;
+        player.amounts[slot] = amount;
+        if (slot <= 4) { self.crafting.update(player); send_inventory(player); }
+    }
+
+    fn edit(player: Connection, frame: Reader, id: i32, now: i64) -> void {
+        let action: i32 = frame.varint();
+        let bits: i64 = frame.long();
+        let x: i32 = to_i32(bits >> 38);
+        let y: i32 = to_i32((bits << 52) >> 52);
+        let z: i32 = to_i32((bits << 26) >> 38);
+        let face: i32 = 0;
+        if (id == 40) { face = frame.byte(); }
+        else { face = frame.varint(); frame.skip(14); }
+        let sequence: i32 = frame.varint();
+        if (!frame.valid || frame.left() != 0 || sequence < 0 || face < 0 || face > 5) { return; }
+        if (id == 40) { self.mine(player, x, y, z, action, now); }
+        else if (action == 0 || action == 1) { self.place(player, x, y, z, face, action); }
+        confirm_edit(player, sequence);
+    }
+
+    fn mine(player: Connection, x: i32, y: i32, z: i32, action: i32, now: i64) -> void {
+        if (action == 1) { player.digging = false; return; }
+        if ((action != 0 && action != 2) || !in_reach(player, x, y, z)) { return; }
+        let state: i32 = self.world.block(x, y, z);
+        if (state <= 0 || state == 15090 || state == 15091) { return; }
+        if (self.settings.mode == 1) {
+            if (action == 0 && self.world.set_block(x, y, z, 0)) { self.notify_block(x, y, z, 0); }
+            return;
+        }
+        let duration: i32 = self.world.mining_time(state);
+        if (duration < 0) { update_block(player, x, y, z, state); return; }
+        if (action == 0) {
+            player.digging = true;
+            player.dig_x = x; player.dig_y = y; player.dig_z = z;
+            player.dig_state = state;
+            player.dig_started = now;
+            return;
+        }
+        let finished: bool = player.digging && player.dig_x == x && player.dig_y == y &&
+            player.dig_z == z && player.dig_state == state && now - player.dig_started >= to_i64(duration);
+        player.digging = false;
+        if (!finished || !self.world.set_block(x, y, z, 0)) { update_block(player, x, y, z, state); return; }
+        self.notify_block(x, y, z, 0);
+        let item: i32 = self.world.drop_item(state);
+        if (item > 0 && len(self.drops) < 1024) {
+            let drop: ItemDrop = new ItemDrop(self.next_id, x, y, z, item, now);
+            self.next_id++;
+            array_append(self.drops, drop);
+            for (let index: i32 = 0; index < len(self.players); index++) {
+                let other: Connection = self.players[index];
+                if (!other.closing && other.phase == 6) { drop.send(other); }
+            }
+        }
+    }
+
+    fn place(player: Connection, x: i32, y: i32, z: i32, face: i32, hand: i32) -> void {
+        if (!in_reach(player, x, y, z)) { return; }
+        if (face == 0) { y--; }
+        else if (face == 1) { y++; }
+        else if (face == 2) { z--; }
+        else if (face == 3) { z++; }
+        else if (face == 4) { x--; }
+        else { x++; }
+        let slot: i32 = 36 + player.selected;
+        if (hand == 1) { slot = 45; }
+        let state: i32 = self.world.block_for_item(player.items[slot]);
+        let old: i32 = self.world.block(x, y, z);
+        if (state < 1 || player.amounts[slot] < 1 || (old != 0 && old != 15090 && old != 15091)) {
+            if (old >= 0) { update_block(player, x, y, z, old); }
+            return;
+        }
+        if (!self.world.set_block(x, y, z, state)) { return; }
+        self.notify_block(x, y, z, state);
+        if (self.settings.mode == 0) {
+            player.amounts[slot]--;
+            if (player.amounts[slot] == 0) { player.items[slot] = 0; }
+            send_inventory(player);
+        }
+    }
+
+    fn notify_block(x: i32, y: i32, z: i32, state: i32) -> void {
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let other: Connection = self.players[index];
+            if (other.phase == 6 && !other.closing && within(x >> 4, other.view_x, self.settings.view) &&
+                within(z >> 4, other.view_z, self.settings.view)) { update_block(other, x, y, z, state); }
+        }
+    }
+
+    fn tick_drops(now: i64) -> void {
+        if (len(self.drops) == 0) { return; }
+        let kept: []ItemDrop = [];
+        for (let index: i32 = 0; index < len(self.drops); index++) {
+            let drop: ItemDrop = self.drops[index];
+            let picked: Connection = null;
+            if (now >= drop.spawned + 250 && now < drop.expires) {
+                for (let player_index: i32 = 0; player_index < len(self.players); player_index++) {
+                    let player: Connection = self.players[player_index];
+                    if (!player.closing && player.phase == 6 && drop.near(player) && take_item(self.world, player, drop.item)) {
+                        picked = player;
+                        break;
+                    }
+                }
+            }
+            if (picked == null && now < drop.expires) { array_append(kept, drop); continue; }
+            for (let player_index: i32 = 0; player_index < len(self.players); player_index++) {
+                let player: Connection = self.players[player_index];
+                if (player.closing || player.phase != 6) { continue; }
+                if (picked != null) {
+                    let packet: Bytes = new Bytes();
+                    packet.varint(drop.id); packet.varint(picked.id); packet.varint(1);
+                    player.send(122, packet);
+                }
+                remove_entity(player, drop.id);
+            }
+        }
+        self.drops = kept;
+    }
+
+    fn broadcast(message: str) -> void {
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let player: Connection = self.players[index];
+            if (player.phase == 6 && !player.closing) { send_message(player, message); }
+        }
+    }
+
+    fn read_console() -> void {
+        let data: str = alloc_string(512);
+        let amount: i32 = file_read(0, ptr(data), 512);
+        if (amount <= 0) { self.input_open = false; return; }
+        for (let index: i32 = 0; index < amount; index++) {
+            let c: i32 = byte_at(data, index);
+            if (c == 10) {
+                self.command(str_trim(self.console), null);
+                self.console = "";
+            } else if (c != 0 && len(self.console) < 256) {
+                self.console = self.console + byte_char(c);
+            }
+        }
+    }
+
+    fn command(command: str, player: Connection) -> void {
+        if (command == "") { return; }
+        let message: str = "";
+        if (command == "help") {
+            if (player == null) { message = "Commands: help, list, seed, save, say, stop"; }
+            else { message = "Commands: help, list, seed, spawn"; }
+        }
+        else if (command == "seed") { message = "Seed: " + to_str(self.world.seed); }
+        else if (command == "list") {
+            message = "Players (" + to_str(self.play_count()) + "):";
+            for (let index: i32 = 0; index < len(self.players); index++) {
+                let member: Connection = self.players[index];
+                if (!member.closing && member.phase == 6) { message = message + " " + member.username; }
+            }
+        } else if (command == "spawn" && player != null) {
+            player.x = i64_to_f64(to_i64(self.world.spawn_x)) + 0.5;
+            player.y = i64_to_f64(to_i64(self.world.spawn_y));
+            player.z = i64_to_f64(to_i64(self.world.spawn_z)) + 0.5;
+            send_teleport(player);
+            center_view(player, self.world.spawn_x >> 4, self.world.spawn_z >> 4, self.settings.view, false);
+            return;
+        } else if (player == null && command == "save") {
+            if (self.world.save()) { message = "World saved"; }
+            else { message = "Failed to save world"; }
+        } else if (player == null && command == "stop") {
+            self.running = false;
+            return;
+        } else if (player == null && starts_with(command, "say ")) {
+            self.broadcast("[Server] " + substr(command, 4));
+            return;
+        } else { message = "Unknown command. Try help."; }
+        if (player == null) { print(message); }
+        else { send_message(player, message); }
+    }
+}
+
+fn valid_name(name: str) -> bool {
+    if (len(name) < 1 || len(name) > 16) { return false; }
+    for (let index: i32 = 0; index < len(name); index++) {
+        let c: i32 = byte_at(name, index);
+        if (!(c >= 65 && c <= 90) && !(c >= 97 && c <= 122) &&
+            !(c >= 48 && c <= 57) && c != 95) { return false; }
+    }
+    return true;
+}
+
+fn printable(message: str) -> bool {
+    if (message == "") { return false; }
+    for (let index: i32 = 0; index < len(message); index++) {
+        let c: i32 = byte_at(message, index);
+        if (c < 32 || c == 127) { return false; }
+    }
+    return true;
+}
+
+
+fn in_reach(player: Connection, x: i32, y: i32, z: i32) -> bool {
+    if (y < -64 || y > 319) { return false; }
+    let dx: f64 = i64_to_f64(to_i64(x)) + 0.5 - player.x;
+    let dy: f64 = i64_to_f64(to_i64(y)) + 0.5 - (player.y + 1.62);
+    let dz: f64 = i64_to_f64(to_i64(z)) + 0.5 - player.z;
+    return dx * dx + dy * dy + dz * dz <= 36.0;
+}

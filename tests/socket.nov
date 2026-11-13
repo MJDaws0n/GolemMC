@@ -1,0 +1,20 @@
+module socket_tests;
+
+import ../lib/std;
+import ../lib/socket;
+
+fn main() -> i32 {
+    let uuid: str = offline_uuid("GolemReference");
+    if (byte_at(uuid, 6) >> 4 != 3 || byte_at(uuid, 8) >> 6 != 2) { return 1; }
+    if (hash_seed(5241482691752223138) != 2668435394204562907) { return 2; }
+    if (monotonic_ms() <= 0) { return 3; }
+    let socket: i32 = socket_listener("127.0.0.1", 0);
+    if (socket < 0) { return 4; }
+    let poller: PollSet = new PollSet(1);
+    poller.add(socket, 1);
+    if (poller.wait(1) != 0) { return 5; }
+    socket_close(socket);
+    let invalid: i32 = socket_listener("not-an-address", 0);
+    if (invalid != -1) { return 6; }
+    return 0;
+}

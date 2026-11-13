@@ -1,0 +1,134 @@
+module crafting;
+
+import ../lib/std;
+import connection;
+import wire;
+import world;
+import play;
+
+class Crafting {
+    let recipes: Bytes;
+    pub let ready: bool;
+
+    pub init() {
+        self.recipes = read_blob("data/crafting-774.bin", 65536);
+        self.ready = self.recipes != null && self.recipes.size % 24 == 0;
+    }
+
+    pub fn update(player: Connection) -> void {
+        player.items[0] = 0;
+        player.amounts[0] = 0;
+        let ingredients: []i32 = [];
+        let left: i32 = 2; let right: i32 = -1;
+        let top: i32 = 2; let bottom: i32 = -1;
+        for (let slot: i32 = 1; slot <= 4; slot++) {
+            if (player.amounts[slot] <= 0) { continue; }
+            let item: i32 = player.items[slot];
+            array_append(ingredients, item);
+            let index: i32 = len(ingredients) - 1;
+            while (index > 0 && ingredients[index - 1] > item) {
+                ingredients[index] = ingredients[index - 1];
+                index--;
+            }
+            ingredients[index] = item;
+            let x: i32 = (slot - 1) % 2;
+            let y: i32 = (slot - 1) / 2;
+            if (x < left) { left = x; }
+            if (x > right) { right = x; }
+            if (y < top) { top = y; }
+            if (y > bottom) { bottom = y; }
+        }
+        if (len(ingredients) == 0) { return; }
+        let reader: Reader = new Reader(self.recipes.data, 0, self.recipes.size);
+        while (reader.left() >= 24) {
+            let next: i32 = reader.offset + 24;
+            let item: i32 = reader.short();
+            let output: i32 = reader.byte();
+            let width: i32 = reader.byte();
+            let height: i32 = reader.byte();
+            let count: i32 = reader.byte();
+            let matched: bool = false;
+            if (count > 0 && count == len(ingredients)) {
+                matched = true;
+                for (let index: i32 = 0; index < count; index++) {
+                    if (reader.short() != ingredients[index]) { matched = false; break; }
+                }
+            } else if (width == right - left + 1 && height == bottom - top + 1) {
+                let direct: bool = true;
+                let mirrored: bool = true;
+                for (let y: i32 = 0; y < height; y++) {
+                    for (let x: i32 = 0; x < width; x++) {
+                        let expected: i32 = reader.short();
+                        let row: i32 = (top + y) * 2 + left + 1;
+                        if (player.items[row + x] != expected) { direct = false; }
+                        if (player.items[row + width - 1 - x] != expected) { mirrored = false; }
+                    }
+                }
+                matched = direct || mirrored;
+            }
+            if (matched) {
+                player.items[0] = item; player.amounts[0] = output;
+                return;
+            }
+            reader.offset = next;
+        }
+    }
+
+    pub fn click(level: World, player: Connection, frame: Reader) -> void {
+        let container: i32 = frame.varint();
+        let revision: i32 = frame.varint();
+        let slot: i32 = frame.short();
+        let button: i32 = frame.byte();
+        let mode: i32 = frame.varint();
+        if (!frame.valid || container != 0) { return; }
+        if (revision == player.inventory_revision && slot < 46 && button <= 1 && mode == 0) {
+            if (slot == 0) { self.take_output(level, player); }
+            else if (slot <= 4 || slot >= 9) { move_stack(level, player, slot, button); }
+        }
+        self.update(player);
+        send_inventory(player);
+    }
+
+    fn take_output(level: World, player: Connection) -> void {
+        let item: i32 = player.items[0];
+        let amount: i32 = player.amounts[0];
+        if (amount == 0 || (player.cursor_amount > 0 && player.cursor_item != item) ||
+            player.cursor_amount + amount > level.max_stack(item)) { return; }
+        for (let slot: i32 = 1; slot <= 4; slot++) {
+            if (player.amounts[slot] > 0) {
+                player.amounts[slot]--;
+                if (player.amounts[slot] == 0) { player.items[slot] = 0; }
+            }
+        }
+        player.cursor_item = item;
+        player.cursor_amount += amount;
+    }
+}
+
+fn move_stack(level: World, player: Connection, slot: i32, button: i32) -> void {
+    let item: i32 = player.items[slot];
+    let amount: i32 = player.amounts[slot];
+    if (player.cursor_amount == 0) {
+        if (amount == 0) { return; }
+        let take: i32 = amount;
+        if (button == 1) { take = (amount + 1) / 2; }
+        player.cursor_item = item; player.cursor_amount = take;
+        player.amounts[slot] -= take;
+        if (player.amounts[slot] == 0) { player.items[slot] = 0; }
+    } else if (amount == 0 || player.cursor_item == item) {
+        let add: i32 = player.cursor_amount;
+        let space: i32 = level.max_stack(player.cursor_item) - amount;
+        if (add > space) { add = space; }
+        if (button == 1 && add > 1) { add = 1; }
+        if (add <= 0) { return; }
+        player.items[slot] = player.cursor_item;
+        player.amounts[slot] += add;
+        player.cursor_amount -= add;
+        if (player.cursor_amount == 0) { player.cursor_item = 0; }
+    } else if (button == 0) {
+        player.items[slot] = player.cursor_item;
+        player.amounts[slot] = player.cursor_amount;
+        player.cursor_item = item;
+        player.cursor_amount = amount;
+    }
+}

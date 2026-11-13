@@ -1,0 +1,234 @@
+module wire;
+
+import ../lib/std;
+import ../lib/file_io;
+import ../lib/socket;
+
+
+class Bytes {
+    pub let data: str;
+    pub let size: i32 = 0;
+    let capacity: i32;
+
+    pub init(capacity: i32 = 128) {
+        self.capacity = capacity;
+        self.data = alloc_string(capacity);
+    }
+
+    pub fn reserve(extra: i32) -> void {
+        if (self.size + extra <= self.capacity) { return; }
+        let capacity: i32 = self.capacity * 2;
+        if (capacity < self.size + extra) { capacity = self.size + extra; }
+        let expanded: str = alloc_string(capacity);
+        memory_copy(ptr(expanded), ptr(self.data), self.size);
+        self.data = expanded;
+        self.capacity = capacity;
+    }
+
+    pub fn byte(value: i32) -> void {
+        if (self.size == self.capacity) { self.reserve(1); }
+        string_set_byte(self.data, self.size, value);
+        self.size++;
+    }
+
+    pub fn append(source: str, offset: i32, amount: i32) -> void {
+        self.reserve(amount);
+        memory_copy(ptr(self.data) + to_u64(self.size), ptr(source) + to_u64(offset), amount);
+        self.size += amount;
+    }
+
+    pub fn short(value: i32) -> void { self.byte(value >> 8); self.byte(value); }
+
+    pub fn int32(value: i32) -> void {
+        self.short(value >> 16);
+        self.short(value);
+    }
+
+    pub fn long(value: i64) -> void {
+        self.int32(to_i32(value >> 32));
+        self.int32(to_i32(value));
+    }
+
+    pub fn varint(value: i32) -> void {
+        let bits: u64 = to_u64(value) & 4294967295;
+        while (bits > 127) {
+            self.byte(to_i32(bits & 127) | 128);
+            bits >>= 7;
+        }
+        self.byte(to_i32(bits));
+    }
+
+    pub fn string(value: str) -> void {
+        let amount: i32 = len(value);
+        self.varint(amount);
+        self.append(value, 0, amount);
+    }
+
+    pub fn double(value: f64) -> void { self.long(f64_bits(value)); }
+
+    pub fn position(x: i32, y: i32, z: i32) -> void {
+        let bits: u64 = ((to_u64(x) & 67108863) << 38) | ((to_u64(z) & 67108863) << 12) | (to_u64(y) & 4095);
+        self.long(to_i64(bits));
+    }
+
+    pub fn frame(id: i32, payload: Bytes) -> void {
+        let id_length: i32 = 1;
+        let remaining: i32 = id;
+        while (remaining > 127) { id_length++; remaining >>= 7; }
+        self.varint(payload.size + id_length);
+        self.varint(id);
+        self.append(payload.data, 0, payload.size);
+    }
+}
+
+class Reader {
+    let data: str;
+    pub let offset: i32;
+    pub let end: i32;
+    pub let valid: bool = true;
+
+    pub init(data: str, offset: i32, end: i32) {
+        self.data = data;
+        self.offset = offset;
+        self.end = end;
+    }
+
+    pub fn left() -> i32 { return self.end - self.offset; }
+
+    pub fn byte() -> i32 {
+        if (self.offset >= self.end) { self.valid = false; return 0; }
+        let value: i32 = byte_at(self.data, self.offset);
+        self.offset++;
+        return value;
+    }
+
+    pub fn short() -> i32 {
+        let upper: i32 = self.byte();
+        return (upper << 8) | self.byte();
+    }
+
+    pub fn int32() -> i32 {
+        let upper: i32 = self.short();
+        return (upper << 16) | self.short();
+    }
+
+    pub fn long() -> i64 {
+        let upper: i64 = to_i64(self.int32());
+        return (upper << 32) | (to_i64(self.int32()) & 4294967295);
+    }
+
+    pub fn double() -> f64 { return f64_from_bits(self.long()); }
+
+    pub fn varint() -> i32 {
+        let value: i32 = 0;
+        for (let index: i32 = 0; index < 5; index++) {
+            let part: i32 = self.byte();
+            if (!self.valid || (index == 4 && part > 15)) { self.valid = false; return 0; }
+            value |= (part & 127) << (index * 7);
+            if (part < 128) { return value; }
+        }
+        self.valid = false;
+        return 0;
+    }
+
+    pub fn skip(amount: i32) -> void {
+        if (amount < 0 || amount > self.left()) { self.valid = false; return; }
+        self.offset += amount;
+    }
+
+    pub fn string(maximum: i32) -> str {
+        let amount: i32 = self.varint();
+        if (!self.valid || amount < 0 || amount > maximum || amount > self.left()) {
+            self.valid = false;
+            return "";
+        }
+        let result: str = copy_bytes(ptr(self.data) + to_u64(self.offset), amount);
+        self.offset += amount;
+        if (len(result) != amount) { self.valid = false; }
+        return result;
+    }
+}
+
+fn json_string(value: str) -> str {
+    let result: StringBuilder = new StringBuilder();
+    let digits: str = "0123456789abcdef";
+    result.append_byte(34);
+    for (let index: i32 = 0; index < len(value); index++) {
+        let c: i32 = byte_at(value, index);
+        if (c == 34 || c == 92) {
+            result.append_byte(92);
+            result.append_byte(c);
+        } else if (c < 32) {
+            result.append("\\u00");
+            result.append_byte(byte_at(digits, c >> 4));
+            result.append_byte(byte_at(digits, c & 15));
+        } else {
+            result.append_byte(c);
+        }
+    }
+    result.append_byte(34);
+    return result.text();
+}
+
+fn read_blob(path: str, limit: i32) -> Bytes {
+    let fd: i32 = file_open_read(path);
+    if (fd < 0) { return null; }
+    let size: u64 = file_size(fd);
+    if (size == 0 || size > to_u64(limit)) { file_close(fd); return null; }
+    let result: Bytes = new Bytes(to_i32(size));
+    while (result.size < to_i32(size)) {
+        let amount: i32 = file_read(fd, ptr(result.data) + to_u64(result.size), to_i32(size) - result.size);
+        if (amount <= 0) { file_close(fd); return null; }
+        result.size += amount;
+    }
+    file_close(fd);
+    return result;
+}
+
+
+fn write_blob(path: str, data: Bytes) -> bool {
+    let temp: str = path + ".tmp";
+    let fd: i32 = file_open_write(temp);
+    if (fd < 0) { return false; }
+    let total: i32 = 0;
+    while (total < data.size) {
+        let amount: i32 = file_write(fd, ptr(data.data) + to_u64(total), data.size - total);
+        if (amount <= 0) { file_close(fd); file_delete(temp); return false; }
+        total += amount;
+    }
+    let synced: bool = sync_file(fd);
+    file_close(fd);
+    if (!synced || file_rename(temp, path) != 0) { file_delete(temp); return false; }
+    return true;
+}
+
+fn skip_nbt(reader: Reader, kind: i32, depth: i32) -> void {
+    if (!reader.valid) { return; }
+    if (depth > 64 || kind < 0 || kind > 12) { reader.valid = false; return; }
+    if (kind == 0) { return; }
+    if (kind == 1) { reader.skip(1); }
+    else if (kind == 2) { reader.skip(2); }
+    else if (kind == 3 || kind == 5) { reader.skip(4); }
+    else if (kind == 4 || kind == 6) { reader.skip(8); }
+    else if (kind == 8) { reader.skip(reader.short()); }
+    else if (kind == 9) {
+        let contained: i32 = reader.byte();
+        let count: i32 = reader.int32();
+        if (count < 0 || count > reader.left() || (contained == 0 && count != 0)) { reader.valid = false; return; }
+        for (let index: i32 = 0; index < count && reader.valid; index++) { skip_nbt(reader, contained, depth + 1); }
+    } else if (kind == 10) {
+        let next: i32 = reader.byte();
+        while (reader.valid && next != 0) {
+            reader.skip(reader.short());
+            skip_nbt(reader, next, depth + 1);
+            next = reader.byte();
+        }
+    } else {
+        let width: i32 = 1;
+        if (kind == 11) { width = 4; }
+        if (kind == 12) { width = 8; }
+        let count: i32 = reader.int32();
+        if (count < 0 || count > reader.left() / width) { reader.valid = false; return; }
+        reader.skip(count * width);
+    }
+}

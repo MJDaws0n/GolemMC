@@ -1,0 +1,135 @@
+module connection;
+
+import ../lib/std;
+import ../lib/socket;
+import wire;
+
+class Connection {
+    pub let fd: i32;
+    pub let phase: i32 = 0;
+    pub let protocol: i32 = 0;
+    pub let closing: bool = false;
+    pub let close_deadline: i64 = 0;
+    pub let finished_writing: bool = false;
+    pub let done: bool = false;
+    pub let touched: i64;
+    pub let username: str = "";
+    pub let uuid: str = "";
+    pub let id: i32 = 0;
+    pub let x: f64 = 0.0;
+    pub let y: f64 = 0.0;
+    pub let z: f64 = 0.0;
+    pub let yaw_bits: i32 = 0;
+    pub let pitch_bits: i32 = 0;
+    pub let ground: bool = false;
+    pub let view_x: i32 = 0;
+    pub let view_z: i32 = 0;
+    pub let streaming: bool = false;
+    pub let next_chunk: i32 = 0;
+    pub let teleport: i32 = 0;
+    pub let teleport_pending: bool = false;
+    pub let next_batch: i64 = 0;
+    pub let keepalive: i64 = 0;
+    pub let last_keepalive: i64 = 0;
+    pub let selected: i32 = 0;
+    pub let inventory_revision: i32 = 0;
+    pub let cursor_item: i32 = 0;
+    pub let cursor_amount: i32 = 0;
+    pub let digging: bool = false;
+    pub let dig_x: i32 = 0;
+    pub let dig_y: i32 = 0;
+    pub let dig_z: i32 = 0;
+    pub let dig_state: i32 = 0;
+    pub let dig_started: i64 = 0;
+    pub let items: []i32 = [];
+    pub let amounts: []i32 = [];
+
+    let incoming: Bytes = new Bytes(8192);
+    let read_offset: i32 = 0;
+    let outgoing: Bytes = new Bytes(8192);
+    let write_offset: i32 = 0;
+
+    pub init(fd: i32, now: i64) {
+        self.fd = fd;
+        self.touched = now;
+        self.last_keepalive = now;
+    }
+
+    pub fn receive(now: i64) -> bool {
+        if (self.read_offset == self.incoming.size) {
+            self.read_offset = 0;
+            self.incoming.size = 0;
+        } else if (self.read_offset > 8192) {
+            let remaining: i32 = self.incoming.size - self.read_offset;
+            let compact: Bytes = new Bytes(remaining + 8192);
+            compact.append(self.incoming.data, self.read_offset, remaining);
+            self.incoming = compact;
+            self.read_offset = 0;
+        }
+        if (self.incoming.size - self.read_offset > 65539) { return false; }
+        self.incoming.reserve(8192);
+        let amount: i32 = socket_read(self.fd, ptr(self.incoming.data) + to_u64(self.incoming.size), 8192);
+        if (amount <= 0) { return amount == -2; }
+        self.incoming.size += amount;
+        self.touched = now;
+        return true;
+    }
+
+    pub fn packet() -> Reader {
+        let available: i32 = self.incoming.size - self.read_offset;
+        let reader: Reader = new Reader(self.incoming.data, self.read_offset, self.incoming.size);
+        let length: i32 = 0;
+        for (let index: i32 = 0; index < 3 && index < available; index++) {
+            let part: i32 = reader.byte();
+            length |= (part & 127) << (index * 7);
+            if (part >= 128) {
+                if (index == 2) { self.closing = true; }
+                continue;
+            }
+            if (length < 1 || length > 65536) { self.closing = true; return null; }
+            if (length > reader.left()) { return null; }
+            reader.end = reader.offset + length;
+            self.read_offset = reader.end;
+            return reader;
+        }
+        return null;
+    }
+
+    pub fn waiting() -> i32 { return self.outgoing.size - self.write_offset; }
+
+    pub fn send(id: i32, payload: Bytes) -> void {
+        if (self.waiting() + payload.size > 2097152) { self.closing = true; return; }
+        self.outgoing.frame(id, payload);
+    }
+
+    pub fn send_raw(data: Bytes) -> void {
+        if (self.waiting() + data.size > 2097152) { self.closing = true; return; }
+        self.outgoing.append(data.data, 0, data.size);
+    }
+
+    pub fn abort() -> void {
+        self.closing = true;
+        self.done = true;
+        self.outgoing.size = 0;
+        self.write_offset = 0;
+    }
+
+    pub fn flush() -> bool {
+        let count: i32 = self.waiting();
+        if (count == 0) { return true; }
+        let result: i32 = socket_write(self.fd, ptr(self.outgoing.data) + to_u64(self.write_offset), count);
+        if (result <= 0) { return result == -2; }
+        self.write_offset += result;
+        if (self.write_offset == self.outgoing.size) {
+            self.write_offset = 0;
+            self.outgoing.size = 0;
+        } else if (self.write_offset >= 262144) {
+            let remaining: i32 = self.waiting();
+            let compact: Bytes = new Bytes(remaining + 8192);
+            compact.append(self.outgoing.data, self.write_offset, remaining);
+            self.outgoing = compact;
+            self.write_offset = 0;
+        }
+        return true;
+    }
+}

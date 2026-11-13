@@ -1,0 +1,271 @@
+module play;
+
+import ../lib/std;
+import settings;
+import wire;
+import world;
+import connection;
+
+fn send_message(player: Connection, message: str) -> void {
+    let packet: Bytes = new Bytes();
+    packet.byte(8); // Network NBT string component
+    packet.short(len(message));
+    packet.append(message, 0, len(message));
+    packet.byte(0);
+    player.send(119, packet);
+}
+
+fn dimensions(packet: Bytes, settings: Settings, level: World) -> void {
+    packet.varint(0);
+    packet.string("minecraft:overworld");
+    packet.long(level.seed_hash);
+    packet.byte(settings.mode); packet.byte(255);
+    packet.byte(0);
+    if (level.flat) { packet.byte(1); } else { packet.byte(0); }
+    packet.byte(0);
+    packet.varint(0); packet.varint(63);
+}
+
+fn join_play(player: Connection, settings: Settings, level: World, ticks: i64) -> void {
+    let login: Bytes = new Bytes();
+    login.int32(player.id); login.byte(0);
+    login.varint(1); login.string("minecraft:overworld");
+    login.varint(settings.max_players); login.varint(settings.view); login.varint(settings.view);
+    login.byte(0); login.byte(1); login.byte(0);
+    dimensions(login, settings, level);
+    login.byte(0);
+    player.send(48, login);
+
+    let difficulty: Bytes = new Bytes();
+    difficulty.varint(settings.difficulty); difficulty.byte(0);
+    player.send(10, difficulty);
+
+    let abilities: Bytes = new Bytes();
+    if (settings.mode == 1) { abilities.byte(13); } else { abilities.byte(0); }
+    abilities.int32(1028443341); // 0.05f
+    abilities.int32(1036831949); // 0.1f
+    player.send(62, abilities);
+
+    let spawn: Bytes = new Bytes();
+    spawn.string("minecraft:overworld");
+    spawn.position(level.spawn_x, level.spawn_y, level.spawn_z);
+    spawn.long(0);
+    player.send(95, spawn);
+
+    let health: Bytes = new Bytes();
+    health.int32(1101004800); health.varint(20); health.int32(1084227584);
+    player.send(102, health);
+
+    let selected: Bytes = new Bytes();
+    selected.varint(player.selected);
+    player.send(103, selected);
+    send_inventory(player);
+    send_command_tree(player);
+    send_time(player, ticks);
+
+    let event: Bytes = new Bytes();
+    event.byte(13); event.int32(0);
+    player.send(38, event);
+    send_teleport(player);
+}
+
+fn send_teleport(player: Connection) -> void {
+    player.teleport++;
+    player.teleport_pending = true;
+    let packet: Bytes = new Bytes();
+    packet.varint(player.teleport);
+    packet.double(player.x); packet.double(player.y); packet.double(player.z);
+    packet.long(0); packet.long(0); packet.long(0);
+    packet.int32(player.yaw_bits); packet.int32(player.pitch_bits); packet.int32(0);
+    player.send(70, packet);
+}
+
+fn send_time(player: Connection, ticks: i64) -> void {
+    let packet: Bytes = new Bytes();
+    packet.long(ticks); packet.long(ticks % 24000); packet.byte(1);
+    player.send(111, packet);
+}
+
+fn encode_stack(packet: Bytes, item: i32, amount: i32) -> void {
+    packet.varint(amount);
+    if (amount > 0) { packet.varint(item); packet.varint(0); packet.varint(0); }
+}
+
+fn send_inventory(player: Connection) -> void {
+    let packet: Bytes = new Bytes();
+    player.inventory_revision = (player.inventory_revision + 1) & 32767;
+    packet.varint(0); packet.varint(player.inventory_revision); packet.varint(46);
+    for (let slot: i32 = 0; slot < 46; slot++) {
+        encode_stack(packet, player.items[slot], player.amounts[slot]);
+    }
+    encode_stack(packet, player.cursor_item, player.cursor_amount);
+    player.send(18, packet);
+}
+
+fn player_info(to: Connection, other: Connection, mode: i32) -> void {
+    let packet: Bytes = new Bytes();
+    packet.byte(13); packet.varint(1);
+    packet.append(other.uuid, 0, 16); packet.string(other.username);
+    packet.varint(0); packet.varint(mode); packet.byte(1);
+    to.send(68, packet);
+}
+
+fn send_command_tree(player: Connection) -> void {
+    let names: []str = ["help", "list", "seed", "spawn"];
+    let packet: Bytes = new Bytes();
+    packet.varint(len(names) + 1);
+    packet.byte(0); // root
+    packet.varint(len(names));
+    for (let index: i32 = 1; index <= len(names); index++) { packet.varint(index); }
+    for (let index: i32 = 0; index < len(names); index++) {
+        packet.byte(5); // executable literal node
+        packet.varint(0);
+        packet.string(names[index]);
+    }
+    packet.varint(0);
+    player.send(16, packet);
+}
+
+fn spawn_player(to: Connection, other: Connection) -> void {
+    let packet: Bytes = new Bytes();
+    packet.varint(other.id); packet.append(other.uuid, 0, 16); packet.varint(155);
+    packet.double(other.x); packet.double(other.y); packet.double(other.z);
+    packet.byte(0); // zero LP Vec3 velocity
+    packet.byte(0); packet.byte(0); packet.byte(0);
+    packet.varint(0);
+    to.send(1, packet);
+}
+
+fn sync_player(to: Connection, other: Connection) -> void {
+    let packet: Bytes = new Bytes();
+    packet.varint(other.id);
+    packet.double(other.x); packet.double(other.y); packet.double(other.z);
+    packet.long(0); packet.long(0); packet.long(0);
+    packet.int32(other.yaw_bits); packet.int32(other.pitch_bits);
+    if (other.ground) { packet.byte(1); } else { packet.byte(0); }
+    to.send(35, packet);
+}
+
+fn remove_player(to: Connection, other: Connection) -> void {
+    remove_entity(to, other.id);
+    let tab: Bytes = new Bytes();
+    tab.varint(1); tab.append(other.uuid, 0, 16);
+    to.send(67, tab);
+}
+
+fn remove_entity(to: Connection, id: i32) -> void {
+    let packet: Bytes = new Bytes();
+    packet.varint(1); packet.varint(id);
+    to.send(75, packet);
+}
+
+fn valid_location(x: f64, y: f64, z: f64) -> bool {
+    return x >= -29999984.0 && x <= 29999984.0 && y >= -2048.0 && y <= 2048.0 && z >= -29999984.0 && z <= 29999984.0;
+}
+
+fn within(value: i32, center: i32, distance: i32) -> bool {
+    return value >= center - distance && value <= center + distance;
+}
+
+fn center_view(player: Connection, x: i32, z: i32, distance: i32, first: bool) -> void {
+    let previous_x: i32 = player.view_x;
+    let previous_z: i32 = player.view_z;
+    if (!first && previous_x == x && previous_z == z) { return; }
+    player.view_x = x;
+    player.view_z = z;
+    player.streaming = true;
+    player.next_chunk = 0;
+    let center: Bytes = new Bytes();
+    center.varint(x); center.varint(z);
+    player.send(92, center);
+    if (first) { return; }
+    for (let dz: i32 = -distance; dz <= distance; dz++) {
+        for (let dx: i32 = -distance; dx <= distance; dx++) {
+            let cx: i32 = previous_x + dx;
+            let cz: i32 = previous_z + dz;
+            if (!within(cx, x, distance) || !within(cz, z, distance)) {
+                let packet: Bytes = new Bytes();
+                packet.int32(cz); packet.int32(cx);
+                player.send(37, packet);
+            }
+        }
+    }
+}
+
+fn stream_chunks(player: Connection, level: World, distance: i32, now: i64) -> void {
+    if (!player.streaming || player.waiting() >= 262144 || now < player.next_batch) { return; }
+    let side: i32 = distance * 2 + 1;
+    let sent: i32 = 0;
+    while (player.next_chunk < side * side && sent < 4 && player.waiting() < 262144) {
+        let index: i32 = player.next_chunk;
+        player.next_chunk++;
+        let dx: i32 = index % side - distance;
+        let dz: i32 = index / side - distance;
+        let chunk: Bytes = level.chunk(player.view_x + dx, player.view_z + dz);
+        if (chunk != null) {
+            if (sent == 0) { player.send(12, new Bytes()); }
+            player.send(44, chunk);
+            sent++;
+        }
+    }
+    if (sent > 0) {
+        let batch: Bytes = new Bytes();
+        batch.varint(sent);
+        player.send(11, batch);
+        player.next_batch = now + 250;
+    }
+    player.streaming = player.next_chunk < side * side;
+}
+
+fn update_block(player: Connection, x: i32, y: i32, z: i32, state: i32) -> void {
+    let packet: Bytes = new Bytes();
+    packet.position(x, y, z); packet.varint(state);
+    player.send(8, packet);
+}
+
+fn confirm_edit(player: Connection, sequence: i32) -> void {
+    let packet: Bytes = new Bytes();
+    packet.varint(sequence);
+    player.send(4, packet);
+}
+
+fn save_player(level: World, player: Connection) -> bool {
+    let data: Bytes = new Bytes(413);
+    data.int32(1196442675); // GPD3 format marker
+    data.double(player.x); data.double(player.y); data.double(player.z);
+    data.int32(player.yaw_bits); data.int32(player.pitch_bits);
+    data.byte(player.selected);
+    for (let index: i32 = 0; index < 46; index++) {
+        data.int32(player.items[index]); data.int32(player.amounts[index]);
+    }
+    data.int32(player.cursor_item); data.int32(player.cursor_amount);
+    if (write_blob(level.player_path(str_lower(player.username)), data)) { return true; }
+    print("Could not save player " + player.username);
+    return false;
+}
+
+fn load_player(level: World, player: Connection) -> void {
+    let data: Bytes = read_blob(level.player_path(str_lower(player.username)), 413);
+    if (data == null || (data.size != 405 && data.size != 413)) { return; }
+    let reader: Reader = new Reader(data.data, 0, data.size);
+    let magic: i32 = reader.int32();
+    if ((magic != 1196442674 || data.size != 405) && (magic != 1196442675 || data.size != 413)) { return; }
+    let x: f64 = reader.double(); let y: f64 = reader.double(); let z: f64 = reader.double();
+    let yaw: i32 = reader.int32(); let pitch: i32 = reader.int32();
+    let slot: i32 = reader.byte();
+    if (!valid_location(x, y, z) || slot >= 9 || !level.has_chunk(block_floor(x) >> 4, block_floor(z) >> 4)) { return; }
+    player.x = x; player.y = y; player.z = z;
+    player.yaw_bits = yaw; player.pitch_bits = pitch; player.selected = slot;
+    for (let index: i32 = 0; index < 46; index++) {
+        let item: i32 = reader.int32(); let amount: i32 = reader.int32();
+        if (index > 0 && amount > 0 && amount <= level.max_stack(item)) {
+            player.items[index] = item; player.amounts[index] = amount;
+        }
+    }
+    if (reader.left() == 8) {
+        let item: i32 = reader.int32(); let amount: i32 = reader.int32();
+        if (amount > 0 && amount <= level.max_stack(item)) {
+            player.cursor_item = item; player.cursor_amount = amount;
+        }
+    }
+}

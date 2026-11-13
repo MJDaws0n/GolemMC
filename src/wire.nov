@@ -2,7 +2,7 @@ module wire;
 
 import ../lib/std;
 import ../lib/file_io;
-import ../lib/socket;
+import ../lib/darwin;
 
 
 class Bytes {
@@ -53,7 +53,7 @@ class Bytes {
         let bits: u64 = to_u64(value) & 4294967295;
         while (bits > 127) {
             self.byte(to_i32(bits & 127) | 128);
-            bits >>= 7;
+            bits = bits >> (7);
         }
         self.byte(to_i32(bits));
     }
@@ -74,7 +74,7 @@ class Bytes {
     pub fn frame(id: i32, payload: Bytes) -> void {
         let id_length: i32 = 1;
         let remaining: i32 = id;
-        while (remaining > 127) { id_length++; remaining >>= 7; }
+        while (remaining > 127) { id_length++; remaining = remaining >> (7); }
         self.varint(payload.size + id_length);
         self.varint(id);
         self.append(payload.data, 0, payload.size);
@@ -124,7 +124,7 @@ class Reader {
         for (let index: i32 = 0; index < 5; index++) {
             let part: i32 = self.byte();
             if (!self.valid || (index == 4 && part > 15)) { self.valid = false; return 0; }
-            value |= (part & 127) << (index * 7);
+            value = value | ((part & 127) << (index * 7));
             if (part < 128) { return value; }
         }
         self.valid = false;

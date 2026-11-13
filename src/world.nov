@@ -1,9 +1,11 @@
 module world;
 
 import ../lib/std;
+import ../lib/decimal;
 import ../lib/file_io;
-import ../lib/socket;
+import ../lib/darwin;
 import wire;
+import identity;
 
 fn block_floor(value: f64) -> i32 {
     let rounded: i32 = to_i32(value);
@@ -59,7 +61,7 @@ class World {
         if (!self.flat) {
             let meta: FileTextResult = read_all_text(source + "/snapshot.txt");
             let fields: []str = string_split(str_trim(meta.data), " ");
-            if (meta.error != "" || len(fields) != 5 || fields[0] != "774" || fields[1] != to_str(seed)) {
+            if (meta.error != "" || len(fields) != 5 || fields[0] != "774" || fields[1] != format_i64(seed)) {
                 self.error = "The snapshot must match protocol 774 and level-seed";
                 return;
             }
@@ -79,7 +81,7 @@ class World {
             return;
         }
         let rules_path: str = folder + "/golem-world.txt";
-        let rules: str = "774 " + to_str(seed) + " " + source + "\n";
+        let rules: str = "774 " + format_i64(seed) + " " + source + "\n";
         if (file_exists(rules_path)) {
             let existing: FileTextResult = read_all_text(rules_path);
             if (existing.error != "" || existing.data != rules) { self.error = "The world directory belongs to a different seed or snapshot"; return; }
@@ -231,7 +233,7 @@ fn flat_chunk(x: i32, z: i32) -> Bytes {
         for (let packed: i32 = 0; packed < 37; packed++) {
             let value: i64 = 0;
             for (let offset: i32 = 0; offset < 7 && packed * 7 + offset < 256; offset++) {
-                value |= to_i64(4) << to_i64(offset * 9);
+                value = value | (to_i64(4) << to_i64(offset * 9));
             }
             result.long(value);
         }
@@ -288,7 +290,7 @@ fn read_palette(reader: Reader, entries: i32, indirect_max: i32, block_states: [
                 value = palette[value];
             }
             array_append(block_states, value);
-            packed >>= to_u64(bits);
+            packed = packed >> (to_u64(bits));
         }
     }
 }
@@ -333,7 +335,7 @@ fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
             for (let word: i32 = 0; word < 1024; word++) {
                 let packed: i64 = 0;
                 for (let index: i32 = 0; index < 4; index++) {
-                    packed |= to_i64(states[word * 4 + index]) << to_i64(index * 15);
+                    packed = packed | (to_i64(states[word * 4 + index]) << to_i64(index * 15));
                 }
                 sections.long(packed);
             }

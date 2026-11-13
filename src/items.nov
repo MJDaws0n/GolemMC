@@ -1,10 +1,11 @@
 module items;
 
 import ../lib/std;
-import ../lib/socket;
+
 import connection;
 import play;
 import wire;
+import identity;
 import world;
 
 class ItemDrop {

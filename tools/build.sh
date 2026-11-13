@@ -1,9 +1,13 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-: "${NOVUS_ROOT:?Set NOVUS_ROOT to the self-hosted Novus checkout with native_call support}"
+: "${NOVUS_ROOT:?Set NOVUS_ROOT to the stock self-hosted Novus checkout}"
 NOVUS_ROOT=$(cd "$NOVUS_ROOT" && pwd)
 NOVUS_BIN=${NOVUS_BIN:-"$NOVUS_ROOT/build/darwin_arm64/novus"}
+if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+    printf "%s\n" "This build uses the macOS Apple Silicon system library." >&2
+    exit 1
+fi
 if [ ! -x "$NOVUS_BIN" ]; then
     printf '%s\n' "Build the self-hosted Novus checkout or set NOVUS_BIN to its compiler." >&2
     exit 1

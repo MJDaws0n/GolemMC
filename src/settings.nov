@@ -1,6 +1,7 @@
 module settings;
 
 import ../lib/std;
+import ../lib/decimal;
 import ../lib/file_io;
 
 class Settings {
@@ -80,5 +81,5 @@ fn matches_seed(text: str, seed: i64) -> bool {
     while (index < len(text) - 1 && byte_at(text, index) == 48) { index++; }
     let digits: str = substr(text, index);
     if (negative && digits != "0") { digits = "-" + digits; }
-    return to_str(seed) == digits;
+    return format_i64(seed) == digits;
 }

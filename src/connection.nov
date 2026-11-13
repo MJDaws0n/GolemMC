@@ -81,7 +81,7 @@ class Connection {
         let length: i32 = 0;
         for (let index: i32 = 0; index < 3 && index < available; index++) {
             let part: i32 = reader.byte();
-            length |= (part & 127) << (index * 7);
+            length = length | ((part & 127) << (index * 7));
             if (part >= 128) {
                 if (index == 2) { self.closing = true; }
                 continue;

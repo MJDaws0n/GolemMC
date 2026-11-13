@@ -1,0 +1,19 @@
+module identity;
+
+import ../lib/std;
+import ../lib/digest;
+
+fn offline_uuid(name: str) -> str {
+    let contents: str = "OfflinePlayer:" + name;
+    let output: str = digest_md5(contents, len(contents));
+    string_set_byte(output, 6, (byte_at(output, 6) & 15) | 48);
+    string_set_byte(output, 8, (byte_at(output, 8) & 63) | 128);
+    return output;
+}
+
+fn hash_seed(seed: i64) -> i64 {
+    let contents: str = alloc_string(8);
+    store64(ptr(contents), i64_to_u64(seed));
+    let digest: str = digest_sha256(contents, 8);
+    return load64(ptr(digest));
+}

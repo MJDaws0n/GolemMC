@@ -1,10 +1,13 @@
 module server;
 
 import ../lib/std;
+import ../lib/decimal;
 import ../lib/file_io;
 import ../lib/socket;
+import ../lib/darwin;
 import settings;
 import wire;
+import identity;
 import connection;
 import world;
 import play;
@@ -69,7 +72,7 @@ class Server {
         let count: i32 = len(self.players);
         for (let index: i32 = 0; index < count; index++) {
             let flags: i32 = 1;
-            if (self.players[index].waiting() > 0) { flags |= 4; }
+            if (self.players[index].waiting() > 0) { flags = flags | (4); }
             self.poller.add(self.players[index].fd, flags);
         }
         let ready: i32 = self.poller.wait(20);
@@ -510,7 +513,7 @@ class Server {
             if (player == null) { message = "Commands: help, list, seed, save, say, stop"; }
             else { message = "Commands: help, list, seed, spawn"; }
         }
-        else if (command == "seed") { message = "Seed: " + to_str(self.world.seed); }
+        else if (command == "seed") { message = "Seed: " + format_i64(self.world.seed); }
         else if (command == "list") {
             message = "Players (" + to_str(self.play_count()) + "):";
             for (let index: i32 = 0; index < len(self.players); index++) {

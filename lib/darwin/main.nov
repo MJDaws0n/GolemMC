@@ -1,0 +1,49 @@
+module darwin;
+
+import ../std;
+
+// Darwin ARM64 returns the error number in x0 and sets carry on failure.
+// Keep this ABI boundary here so callers use ordinary Novus functions.
+fn darwin_syscall(number: i32, a0: u64 = 0, a1: u64 = 0, a2: u64 = 0, a3: u64 = 0, a4: u64 = 0, a5: u64 = 0) -> i32 {
+    let trap: i32 = 0x2000000 + number;
+    mov(x0, a0);
+    mov(x1, a1);
+    mov(x2, a2);
+    mov(x3, a3);
+    mov(x4, a4);
+    mov(x5, a5);
+    mov(x16, trap);
+    syscall();
+    let failed: bool = getflag(carry);
+    let result: u64 = getreg(x0);
+    if (failed) { return -to_i32(result); }
+    return to_i32(result);
+}
+
+fn monotonic_ms() -> i64 {
+    let timebase: str = alloc_string(8);
+    let address: u64 = ptr(timebase);
+    mov(x0, address);
+    mov(x16, -89); // mach_timebase_info
+    syscall();
+    let status: u64 = getreg(x0);
+    if (status != 0) { return get_time_ns() / 1000000; }
+    let numerator: i64 = to_i64(load32(address));
+    let denominator: i64 = to_i64(load32(address + 4));
+    if (numerator <= 0 || denominator <= 0) { return get_time_ns() / 1000000; }
+    mov(x16, -3); // MACH_ARM_TRAP_ABSTIME
+    syscall();
+    let ticks: i64 = to_i64(getreg(x0));
+    let scale: i64 = denominator * 1000000;
+    return (ticks / scale) * numerator + ((ticks % scale) * numerator) / scale;
+}
+
+fn sync_file(fd: i32) -> bool {
+    let result: i32 = darwin_syscall(95, to_u64(fd)); // fsync
+    while (result == -4) { result = darwin_syscall(95, to_u64(fd)); }
+    return result == 0;
+}
+
+fn lock_file(fd: i32) -> bool {
+    return darwin_syscall(131, to_u64(fd), 6) == 0; // flock(LOCK_EX | LOCK_NB)
+}

@@ -1,33 +1,55 @@
-module golem_socket;
+module socket;
 
 import ../std;
+import ../darwin;
 
-fn posix_errno() -> i32 { return load32(i64_to_u64(native_call("__error"))); }
+fn socket_shutdown_write(fd: i32) -> void { darwin_syscall(134, to_u64(fd), 1); }
+fn socket_close(fd: i32) -> void { darwin_syscall(6, to_u64(fd)); }
 
-fn socket_error() -> i32 {
-    let code: i32 = posix_errno();
-    if (code == 35 || code == 4) { return -2; } // EAGAIN or EINTR
-    return -1;
-}
-
-fn socket_shutdown_write(fd: i32) -> void { native_call("shutdown", fd, 1); }
-
-fn socket_close(fd: i32) -> void { native_call("close", fd); }
-
-fn socket_listener(address: str, port: i32) -> i32 {
+fn ipv4_endpoint(address: str, port: i32) -> str {
+    if (port < 0 || port > 65535) { return ""; }
     let endpoint: str = alloc_string(16);
     memset(ptr(endpoint), 0, 16);
     string_set_byte(endpoint, 0, 16);
     string_set_byte(endpoint, 1, 2); // AF_INET
     string_set_byte(endpoint, 2, port >> 8);
     string_set_byte(endpoint, 3, port);
-    if (native_call("inet_pton", 2, ptr(address), ptr(endpoint) + 4) != 1) { return -1; }
-    let fd: i32 = to_i32(native_call("socket", 2, 1, 0));
-    if (fd < 0) { return -1; }
+    let offset: i32 = 0;
+    for (let index: i32 = 0; index < 4; index++) {
+        let value: i32 = 0;
+        let digits: i32 = 0;
+        while (offset < len(address) && byte_at(address, offset) != 46) {
+            let digit: i32 = byte_at(address, offset) - 48;
+            if (digit < 0 || digit > 9 || digits == 3) { return ""; }
+            value = value * 10 + digit;
+            offset++;
+            digits++;
+        }
+        if (digits == 0 || value > 255) { return ""; }
+        string_set_byte(endpoint, 4 + index, value);
+        if (index < 3) {
+            if (offset == len(address)) { return ""; }
+            offset++;
+        }
+    }
+    if (offset != len(address)) { return ""; }
+    return endpoint;
+}
+
+fn socket_option(fd: i32, level: i32, name: i32) -> bool {
     let one: i32 = 1;
-    if (to_i32(native_call("setsockopt", fd, 65535, 4, &one, 4)) < 0 ||
-        to_i32(native_call("bind", fd, ptr(endpoint), 16)) < 0 ||
-        to_i32(native_call("listen", fd, 32)) < 0) {
+    let address: u64 = &one;
+    return darwin_syscall(105, to_u64(fd), to_u64(level), to_u64(name), address, 4) == 0;
+}
+
+fn socket_listener(address: str, port: i32) -> i32 {
+    let endpoint: str = ipv4_endpoint(address, port);
+    if (endpoint == "") { return -1; }
+    let fd: i32 = darwin_syscall(97, 2, 1); // socket(AF_INET, SOCK_STREAM)
+    if (fd < 0) { return -1; }
+    if (!socket_option(fd, 65535, 4) ||
+        darwin_syscall(104, to_u64(fd), ptr(endpoint), 16) < 0 ||
+        darwin_syscall(106, to_u64(fd), 32) < 0) {
         socket_close(fd);
         return -1;
     }
@@ -35,77 +57,55 @@ fn socket_listener(address: str, port: i32) -> i32 {
 }
 
 fn socket_accept(fd: i32) -> i32 {
-    let client: i32 = to_i32(native_call("accept", fd, 0, 0));
+    let client: i32 = darwin_syscall(30, to_u64(fd)); // accept
     if (client < 0) { return -1; }
-    let one: i32 = 1;
-    if (to_i32(native_call("setsockopt", client, 65535, 0x1022, &one, 4)) < 0) {
+    if (!socket_option(client, 65535, 0x1022)) { // SOL_SOCKET, SO_NOSIGPIPE
         socket_close(client);
         return -1;
     }
-    native_call("setsockopt", client, 6, 1, &one, 4); // TCP_NODELAY
+    socket_option(client, 6, 1); // IPPROTO_TCP, TCP_NODELAY
     return client;
 }
 
+fn socket_io_result(result: i32) -> i32 {
+    if (result == -35 || result == -4) { return -2; } // EAGAIN or EINTR
+    if (result < 0) { return -1; }
+    return result;
+}
+
 fn socket_read(fd: i32, address: u64, amount: i32) -> i32 {
-    let result: i64 = native_call("recv", fd, address, amount, 0x80);
-    if (result < 0) { return socket_error(); }
-    return to_i32(result);
+    return socket_io_result(darwin_syscall(29, to_u64(fd), address, to_u64(amount), 0x80)); // recvfrom, MSG_DONTWAIT
 }
 
 fn socket_write(fd: i32, address: u64, amount: i32) -> i32 {
-    let result: i64 = native_call("send", fd, address, amount, 0x80);
-    if (result < 0) { return socket_error(); }
-    return to_i32(result);
+    return socket_io_result(darwin_syscall(133, to_u64(fd), address, to_u64(amount), 0x80)); // sendto, MSG_DONTWAIT
 }
 
 class PollSet {
     let data: str;
     let size: i32 = 0;
+    let capacity: i32;
 
-    pub init(capacity: i32) { self.data = alloc_string(capacity * 8); }
+    pub init(capacity: i32) {
+        self.capacity = capacity;
+        self.data = alloc_string(capacity * 8);
+    }
 
     pub fn clear() -> void { self.size = 0; }
 
     pub fn add(fd: i32, events: i32) -> void {
+        if (self.size >= self.capacity) { return; }
         let address: u64 = ptr(self.data) + to_u64(self.size * 8);
         store32(address, fd);
-        store32(address + 4, events);
+        store32(address + 4, events & 65535);
         self.size++;
     }
 
     pub fn wait(timeout: i32) -> i32 {
-        return to_i32(native_call("poll", ptr(self.data), self.size, timeout));
+        return darwin_syscall(230, ptr(self.data), to_u64(self.size), to_u64(timeout)); // poll
     }
 
     pub fn events(index: i32) -> i32 {
         return byte_at(self.data, index * 8 + 6) | (byte_at(self.data, index * 8 + 7) << 8);
     }
 }
-
-fn monotonic_ms() -> i64 {
-    let timespec: str = alloc_string(16);
-    native_call("clock_gettime", 6, ptr(timespec)); // CLOCK_MONOTONIC
-    return load64(ptr(timespec)) * 1000 + load64(ptr(timespec) + 8) / 1000000;
-}
-
-fn offline_uuid(name: str) -> str {
-    let contents: str = "OfflinePlayer:" + name;
-    let output: str = alloc_string(16);
-    native_call("CC_MD5", ptr(contents), len(contents), ptr(output));
-    string_set_byte(output, 6, (byte_at(output, 6) & 15) | 48);
-    string_set_byte(output, 8, (byte_at(output, 8) & 63) | 128);
-    return output;
-}
-
-fn hash_seed(seed: i64) -> i64 {
-    let output: str = alloc_string(32);
-    let contents: str = alloc_string(8);
-    store64(ptr(contents), i64_to_u64(seed));
-    native_call("CC_SHA256", ptr(contents), 8, ptr(output));
-    return load64(ptr(output));
-}
-
-fn sync_file(fd: i32) -> bool { return to_i32(native_call("fsync", fd)) == 0; }
-
-
-fn lock_file(fd: i32) -> bool { return to_i32(native_call("flock", fd, 6)) == 0; }

@@ -1,10 +1,10 @@
 # GolemMC
 
-A native Novus server for Minecraft Java Edition 1.21.11, protocol 774. The rewrite uses Novus classes for connections, packets, worlds and gameplay. The GolemMC application and its socket library use no inline assembly. The socket library calls macOS system APIs through Novus `native_call`.
+A native Novus server for Minecraft Java Edition 1.21.11, protocol 774. The rewrite uses Novus classes for connections, packets, worlds and gameplay. GolemMC application code uses ordinary Novus functions. The reusable `lib/darwin` library contains the Apple Silicon syscall bindings. The socket, digest and decimal libraries use stock Novus.
 
 ## Build and run
 
-The verified host is Apple Silicon macOS. Install the Xcode Command Line Tools and use the self-hosted Novus checkout with `native_call`, bitwise compound assignments and the address-of type fix. The rewrite was verified with Novus commit `21177fb` on the local `feature/golemmc-native-apis` branch. Build that checkout before building GolemMC.
+The verified host is Apple Silicon macOS. Install the Xcode Command Line Tools and build the stock [self-hosted Novus](https://github.com/MJDaws0n/Novus/tree/self-hosted-novus) checkout. GolemMC was verified with Novus commit `65febef`.
 
 ```sh
 export NOVUS_ROOT=/path/to/Novus/compiler

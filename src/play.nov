@@ -174,8 +174,6 @@ fn center_view(player: Connection, x: i32, z: i32, distance: i32, first: bool) -
     player.view_z = z;
     player.streaming = true;
     player.next_chunk = 0;
-    player.next_missing = 0;
-    player.missing_chunks = false;
     let center: Bytes = new Bytes();
     center.varint(x); center.varint(z);
     player.send(92, center);
@@ -204,20 +202,14 @@ fn center_view(player: Connection, x: i32, z: i32, distance: i32, first: bool) -
 }
 
 fn stream_chunks(player: Connection, level: World, now: i64) -> void {
-    if (!player.streaming || player.waiting() >= 262144 || now < player.next_batch || now < player.next_missing) { return; }
+    if (!player.streaming || player.waiting() >= 262144 || now < player.next_batch) { return; }
     let sent: i32 = 0;
     while (player.next_chunk < len(player.view_chunks) && sent < 4 && player.waiting() < 262144) {
         let position: ChunkPosition = player.view_chunks[player.next_chunk];
         player.next_chunk++;
         if (player.has_sent(position.x, position.z)) { continue; }
         let chunk: Bytes = level.chunk(position.x, position.z);
-        if (chunk == null) {
-            if (level.generating) {
-                level.request_chunk(position.x, position.z);
-                player.missing_chunks = true;
-            }
-            continue;
-        }
+        if (chunk == null) { continue; }
         if (sent == 0) { player.send(12, new Bytes()); }
         player.send(44, chunk);
         array_append(player.sent_chunks, position);
@@ -229,14 +221,7 @@ fn stream_chunks(player: Connection, level: World, now: i64) -> void {
         player.send(11, batch);
         player.next_batch = now + 250;
     }
-    if (player.next_chunk == len(player.view_chunks)) {
-        player.streaming = player.missing_chunks;
-        if (player.streaming) {
-            player.next_chunk = 0;
-            player.next_missing = now + 200;
-            player.missing_chunks = false;
-        }
-    }
+    player.streaming = player.next_chunk < len(player.view_chunks);
 }
 
 fn update_block(player: Connection, x: i32, y: i32, z: i32, state: i32) -> void {

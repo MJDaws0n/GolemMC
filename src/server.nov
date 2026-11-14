@@ -40,7 +40,7 @@ class Server {
         if (!self.crafting.ready) { self.error = "Cannot load crafting recipes"; return; }
         self.configuration = read_blob("data/configuration-774.bin", 1048576);
         if (self.configuration == null) { self.error = "Cannot load protocol 774 registries. Run from the GolemMC checkout."; return; }
-        self.world = new World(options.world, options.source, options.seed, options.generator);
+        self.world = new World(options.world, options.source, options.seed);
         self.error = self.world.error;
     }
 
@@ -142,20 +142,6 @@ class Server {
             player.last_keepalive = now;
             packet.long(now);
             player.send(43, packet);
-        }
-        if (player.awaiting_terrain && !player.teleport_pending) {
-            let x: i32 = floor_block(player.destination_x) >> 4;
-            let z: i32 = floor_block(player.destination_z) >> 4;
-            if (self.world.has_chunk(x, z)) {
-                player.awaiting_terrain = false;
-                player.x = player.destination_x; player.y = player.destination_y; player.z = player.destination_z;
-                center_view(player, x, z, self.settings.view, false);
-                send_teleport(player);
-                self.sync_movement(player);
-            } else if (now - player.terrain_started >= 30000) {
-                player.awaiting_terrain = false;
-                send_message(player, "Terrain generation is taking longer than expected. Try moving again.");
-            } else { self.world.request_chunk(x, z); }
         }
         if (now - self.updated >= 1000) { send_time(player, ticks); }
         stream_chunks(player, self.world, now);
@@ -323,7 +309,7 @@ class Server {
             let reply: i64 = frame.long();
             if (frame.valid && frame.left() == 0 && reply == player.keepalive) { player.keepalive = 0; }
         } else if (id == 29 || id == 30 || id == 31 || id == 32) {
-            if (!player.teleport_pending) { self.move(player, frame, id, now); }
+            if (!player.teleport_pending) { self.move(player, frame, id); }
         } else if (id == 8) {
             let message: str = frame.string(256);
             if (frame.valid && printable(message)) { self.broadcast("<" + player.username + "> " + message); }
@@ -345,7 +331,7 @@ class Server {
         }
     }
 
-    fn move(player: Connection, frame: Reader, id: i32, now: i64) -> void {
+    fn move(player: Connection, frame: Reader, id: i32) -> void {
         let x: f64 = player.x;
         let y: f64 = player.y;
         let z: f64 = player.z;
@@ -367,17 +353,9 @@ class Server {
         let cx: i32 = floor_block(x) >> 4;
         let cz: i32 = floor_block(z) >> 4;
         if ((cx != player.view_x || cz != player.view_z) && !self.world.has_chunk(cx, cz)) {
-            if (self.world.generating) {
-                if (!player.awaiting_terrain || cx != floor_block(player.destination_x) >> 4 ||
-                    cz != floor_block(player.destination_z) >> 4) { player.terrain_started = now; }
-                player.awaiting_terrain = true;
-                player.destination_x = x; player.destination_y = y; player.destination_z = z;
-                self.world.request_chunk(cx, cz);
-            }
             send_teleport(player);
             return;
         }
-        if (cx != player.view_x || cz != player.view_z) { player.awaiting_terrain = false; }
         player.x = x; player.y = y; player.z = z; player.ground = (flags & 1) != 0;
         center_view(player, cx, cz, self.settings.view, false);
         self.sync_movement(player);
@@ -650,7 +628,6 @@ class Server {
                 if (!member.closing && member.phase == 6) { message = message + " " + member.username; }
             }
         } else if (command == "spawn" && player != null) {
-            player.awaiting_terrain = false;
             player.x = i64_to_f64(to_i64(self.world.spawn_x)) + 0.5;
             player.y = i64_to_f64(to_i64(self.world.spawn_y));
             player.z = i64_to_f64(to_i64(self.world.spawn_z)) + 0.5;

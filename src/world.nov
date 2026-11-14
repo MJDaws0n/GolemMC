@@ -38,7 +38,6 @@ class World {
     pub let seed: i64;
     pub let seed_hash: i64;
     pub let flat: bool;
-    pub let generating: bool;
     pub let spawn_x: i32 = 0;
     pub let spawn_y: i32 = -60;
     pub let spawn_z: i32 = 0;
@@ -56,10 +55,8 @@ class World {
     let light_cursor: i32 = 0;
     let materials: Bytes;
 
-    pub init(folder: str, source: str, seed: i64, generator: str = "") {
+    pub init(folder: str, source: str, seed: i64) {
         self.folder = folder;
-        self.generating = generator != "";
-        if (self.generating) { source = generator; }
         self.source = source;
         self.seed = seed;
         self.seed_hash = hash_seed(seed);
@@ -73,13 +70,6 @@ class World {
             self.item_states == null || self.item_limits == null || self.block_rules == null ||
             self.item_states.size != self.item_limits.size * 4 || self.block_rules.size % 8 != 0) {
             self.error = "Cannot load protocol 774 block and item registries"; return;
-        }
-        if (self.generating) {
-            let worker: FileTextResult = read_all_text(source + "/worldgen.txt");
-            if (worker.error != "" || str_trim(worker.data) != "774 " + format_i64(seed)) {
-                self.error = "Start the vanilla-worldgen worker with the configured directory and seed";
-                return;
-            }
         }
         if (!self.flat) {
             let meta: FileTextResult = read_all_text(source + "/snapshot.txt");
@@ -140,13 +130,6 @@ class World {
 
     pub fn has_chunk(x: i32, z: i32) -> bool {
         return self.flat || file_exists(chunk_path(self.source, x, z));
-    }
-
-    pub fn request_chunk(x: i32, z: i32) -> void {
-        if (!self.generating || x < -1874998 || x > 1874998 || z < -1874998 || z > 1874998 ||
-            self.has_chunk(x, z)) { return; }
-        let path: str = self.source + "/requests/" + to_str(x) + "." + to_str(z);
-        if (!file_exists(path)) { write_all_text(path, ""); }
     }
 
     pub fn player_path(username: str) -> str { return self.folder + "/players/" + username + ".bin"; }

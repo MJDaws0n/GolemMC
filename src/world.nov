@@ -6,12 +6,9 @@ import ../lib/file_io;
 import ../lib/darwin;
 import wire;
 import identity;
+import light;
 
-fn block_floor(value: f64) -> i32 {
-    let rounded: i32 = to_i32(value);
-    if (value < i64_to_f64(to_i64(rounded))) { return rounded - 1; }
-    return rounded;
-}
+fn air_block(state: i32) -> bool { return state == 0 || state == 15090 || state == 15091; }
 
 fn chunk_path(folder: str, x: i32, z: i32) -> str {
     return folder + "/chunks/" + to_str(x) + "." + to_str(z) + ".bin";
@@ -22,16 +19,26 @@ class BlockChange {
     pub let y: i32;
     pub let z: i32;
     pub let state: i32;
+    pub let original: i32;
 
-    pub init(x: i32, y: i32, z: i32, state: i32) {
-        self.x = x; self.y = y; self.z = z; self.state = state;
+    pub init(x: i32, y: i32, z: i32, state: i32, original: i32) {
+        self.x = x; self.y = y; self.z = z; self.state = state; self.original = original;
     }
+}
+
+class CachedLight {
+    pub let x: i32;
+    pub let z: i32;
+    pub let data: Bytes;
+
+    pub init(x: i32, z: i32, data: Bytes) { self.x = x; self.z = z; self.data = data; }
 }
 
 class World {
     pub let seed: i64;
     pub let seed_hash: i64;
     pub let flat: bool;
+    pub let generating: bool;
     pub let spawn_x: i32 = 0;
     pub let spawn_y: i32 = -60;
     pub let spawn_z: i32 = 0;
@@ -44,9 +51,15 @@ class World {
     let item_states: Bytes;
     let item_limits: Bytes;
     let block_rules: Bytes;
+    let light_rules: Bytes;
+    let light_cache: []CachedLight = [];
+    let light_cursor: i32 = 0;
+    let materials: Bytes;
 
-    pub init(folder: str, source: str, seed: i64) {
+    pub init(folder: str, source: str, seed: i64, generator: str = "") {
         self.folder = folder;
+        self.generating = generator != "";
+        if (self.generating) { source = generator; }
         self.source = source;
         self.seed = seed;
         self.seed_hash = hash_seed(seed);
@@ -54,9 +67,19 @@ class World {
         self.item_states = read_blob("data/item-block-states-774.bin", 16384);
         self.item_limits = read_blob("data/item-limits-774.bin", 4096);
         self.block_rules = read_blob("data/block-rules-774.bin", 262144);
-        if (self.item_states == null || self.item_limits == null || self.block_rules == null ||
+        self.light_rules = read_blob("data/light-rules-774.bin", 65536);
+        self.materials = read_blob("data/block-materials-774.bin", 32768);
+        if (self.light_rules == null || self.materials == null || self.light_rules.size != 59342 || self.materials.size != 29671 ||
+            self.item_states == null || self.item_limits == null || self.block_rules == null ||
             self.item_states.size != self.item_limits.size * 4 || self.block_rules.size % 8 != 0) {
             self.error = "Cannot load protocol 774 block and item registries"; return;
+        }
+        if (self.generating) {
+            let worker: FileTextResult = read_all_text(source + "/worldgen.txt");
+            if (worker.error != "" || str_trim(worker.data) != "774 " + format_i64(seed)) {
+                self.error = "Start the vanilla-worldgen worker with the configured directory and seed";
+                return;
+            }
         }
         if (!self.flat) {
             let meta: FileTextResult = read_all_text(source + "/snapshot.txt");
@@ -119,6 +142,13 @@ class World {
         return self.flat || file_exists(chunk_path(self.source, x, z));
     }
 
+    pub fn request_chunk(x: i32, z: i32) -> void {
+        if (!self.generating || x < -1874998 || x > 1874998 || z < -1874998 || z > 1874998 ||
+            self.has_chunk(x, z)) { return; }
+        let path: str = self.source + "/requests/" + to_str(x) + "." + to_str(z);
+        if (!file_exists(path)) { write_all_text(path, ""); }
+    }
+
     pub fn player_path(username: str) -> str { return self.folder + "/players/" + username + ".bin"; }
 
     pub fn block_for_item(item: i32) -> i32 {
@@ -133,6 +163,10 @@ class World {
             let change: BlockChange = self.changes[index];
             if (change.x == x && change.y == y && change.z == z) { return change.state; }
         }
+        return self.original_block(x, y, z);
+    }
+
+    fn original_block(x: i32, y: i32, z: i32) -> i32 {
         if (self.flat) {
             if (y == -64) { return 85; }
             if (y == -63 || y == -62) { return 10; }
@@ -150,12 +184,17 @@ class World {
         for (let index: i32 = 0; index < len(self.changes); index++) {
             let change: BlockChange = self.changes[index];
             if (change.x == x && change.y == y && change.z == z) {
-                if (change.state != state) { change.state = state; self.dirty = true; }
+                if (change.state != state) {
+                    if (self.light_changed(change.state, state)) { self.invalidate_light(x, z); }
+                    change.state = state;
+                    self.dirty = true;
+                }
                 return true;
             }
         }
         if (len(self.changes) >= 1048575) { return false; }
-        array_append(self.changes, new BlockChange(x, y, z, state));
+        self.invalidate_light(x, z);
+        array_append(self.changes, new BlockChange(x, y, z, state, self.original_block(x, y, z)));
         self.dirty = true;
         return true;
     }
@@ -163,31 +202,85 @@ class World {
     fn load() -> void {
         let path: str = self.folder + "/blocks-774.bin";
         if (!file_exists(path)) { return; }
-        let data: Bytes = read_blob(path, 16777216);
-        if (data == null || data.size < 4 || (data.size - 4) % 16 != 0) {
+        let data: Bytes = read_blob(path, 20971504);
+        if (data == null || data.size < 4) {
             self.error = "Invalid block save"; return;
         }
         let reader: Reader = new Reader(data.data, 0, data.size);
-        if (reader.int32() != 1196245810) { self.error = "Unknown block save format"; return; }
+        let version: i32 = reader.int32();
+        if (version != 1196245810 && version != 1196245811) { self.error = "Unknown block save format"; return; }
+        let stride: i32 = 20;
+        if (version == 1196245810) { stride = 16; }
+        if (reader.left() % stride != 0 || reader.left() / stride > 1048575) { self.error = "Invalid block save size"; return; }
         while (reader.left() > 0) {
             let x: i32 = reader.int32(); let y: i32 = reader.int32();
             let z: i32 = reader.int32(); let state: i32 = reader.int32();
             if (state < 0 || state >= self.block_rules.size / 8 || y < -64 || y > 319) { self.error = "Invalid block save record"; return; }
-            array_append(self.changes, new BlockChange(x, y, z, state));
+            let original: i32 = -1;
+            if (version == 1196245811) { original = reader.int32(); }
+            else { original = self.original_block(x, y, z); }
+            if (original < -1 || original >= self.block_rules.size / 8) { self.error = "Invalid original block state"; return; }
+            array_append(self.changes, new BlockChange(x, y, z, state, original));
         }
     }
 
     pub fn save() -> bool {
         if (!self.dirty) { return true; }
-        let data: Bytes = new Bytes(4 + len(self.changes) * 16);
-        data.int32(1196245810);
+        let data: Bytes = new Bytes(4 + len(self.changes) * 20);
+        data.int32(1196245811);
         for (let index: i32 = 0; index < len(self.changes); index++) {
             let change: BlockChange = self.changes[index];
-            data.int32(change.x); data.int32(change.y); data.int32(change.z); data.int32(change.state);
+            data.int32(change.x); data.int32(change.y); data.int32(change.z); data.int32(change.state); data.int32(change.original);
         }
         if (!write_blob(self.folder + "/blocks-774.bin", data)) { return false; }
         self.dirty = false;
         return true;
+    }
+
+    pub fn light_changed(before: i32, after: i32) -> bool {
+        if (before < 0 || after < 0 || before >= self.light_rules.size / 2 || after >= self.light_rules.size / 2) { return false; }
+        return byte_at(self.light_rules.data, before * 2) != byte_at(self.light_rules.data, after * 2) ||
+            byte_at(self.light_rules.data, before * 2 + 1) != byte_at(self.light_rules.data, after * 2 + 1);
+    }
+
+    fn invalidate_light(x: i32, z: i32) -> void {
+        for (let index: i32 = 0; index < len(self.light_cache); index++) {
+            let cached: CachedLight = self.light_cache[index];
+            if (cached != null && light_reaches(x, z, cached.x, cached.z)) { self.light_cache[index] = null; }
+        }
+    }
+
+    pub fn lighting(x: i32, z: i32) -> Bytes {
+        if (!self.has_chunk(x, z)) { return null; }
+        for (let index: i32 = 0; index < len(self.light_cache); index++) {
+            let cached: CachedLight = self.light_cache[index];
+            if (cached != null && cached.x == x && cached.z == z) { return cached.data; }
+        }
+        let volume: LightVolume = new LightVolume(self.light_rules.data);
+        for (let dz: i32 = 0; dz < 3; dz++) {
+            for (let dx: i32 = 0; dx < 3; dx++) {
+                if (self.flat) {
+                    volume.fill_flat(dx, dz);
+                } else {
+                    let source: Bytes = read_blob(chunk_path(self.source, x + dx - 1, z + dz - 1), 2097151);
+                    if (source != null && !load_light_blocks(volume, source, dx, dz)) { return null; }
+                }
+            }
+        }
+        for (let index: i32 = 0; index < len(self.changes); index++) {
+            let change: BlockChange = self.changes[index];
+            let vx: i32 = change.x - (x - 1) * 16;
+            let vz: i32 = change.z - (z - 1) * 16;
+            if (vx >= 0 && vx < 48 && vz >= 0 && vz < 48) { volume.set(vx, change.y + 64, vz, change.state); }
+        }
+        let packet: Bytes = volume.calculate();
+        let cached: CachedLight = new CachedLight(x, z, packet);
+        if (len(self.light_cache) < 48) { array_append(self.light_cache, cached); }
+        else {
+            self.light_cache[self.light_cursor] = cached;
+            self.light_cursor = (self.light_cursor + 1) % 48;
+        }
+        return packet;
     }
 
     pub fn chunk(x: i32, z: i32) -> Bytes {
@@ -196,13 +289,25 @@ class World {
         else { original = read_blob(chunk_path(self.source, x, z), 2097151); }
         if (original == null) { return null; }
         let edits: []BlockChange = [];
+        let relight: bool = false;
         for (let index: i32 = 0; index < len(self.changes); index++) {
             let change: BlockChange = self.changes[index];
+            if (change.state == change.original) { continue; }
             if (change.x >> 4 == x && change.z >> 4 == z) { array_append(edits, change); }
+            if (light_reaches(change.x, change.z, x, z) && (change.original < 0 || self.light_changed(change.original, change.state))) { relight = true; }
         }
-        if (len(edits) == 0) { return original; }
-        return apply_edits(original, edits);
+        if (!relight && len(edits) == 0) { return original; }
+        let lighting: Bytes = null;
+        if (relight) {
+            lighting = self.lighting(x, z);
+            if (lighting == null) { return null; }
+        }
+        return apply_edits(original, edits, lighting, self.materials.data);
     }
+}
+
+fn light_reaches(x: i32, z: i32, cx: i32, cz: i32) -> bool {
+    return x >= cx * 16 - 14 && x <= cx * 16 + 29 && z >= cz * 16 - 14 && z <= cz * 16 + 29;
 }
 
 fn flat_chunk(x: i32, z: i32) -> Bytes {
@@ -295,15 +400,15 @@ fn read_palette(reader: Reader, entries: i32, indirect_max: i32, block_states: [
     }
 }
 
-fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
+fn apply_edits(chunk: Bytes, edits: []BlockChange, lighting: Bytes, materials: str) -> Bytes {
     let reader: Reader = new Reader(chunk.data, 0, chunk.size);
     if (!skip_heightmaps(reader)) { return null; }
-    let header: i32 = reader.offset;
     let sections_length: i32 = reader.varint();
     if (!reader.valid || sections_length < 0 || sections_length > reader.left()) { return null; }
     let tail: i32 = reader.offset + sections_length;
     reader.end = tail;
     let sections: Bytes = new Bytes(sections_length);
+    let heightmaps: Heightmaps = new Heightmaps();
     for (let section: i32 = 0; section < 24; section++) {
         let start: i32 = reader.offset;
         let decode: bool = false;
@@ -312,7 +417,7 @@ fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
         }
         reader.short();
         let states: []i32 = [];
-        read_palette(reader, 4096, 8, states, decode);
+        read_palette(reader, 4096, 8, states, len(edits) > 0);
         let biome_start: i32 = reader.offset;
         read_palette(reader, 64, 3, [], false);
         if (!reader.valid) { return null; }
@@ -328,7 +433,7 @@ fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
             let non_air: i32 = 0;
             for (let index: i32 = 0; index < 4096; index++) {
                 let state: i32 = states[index];
-                if (state != 0 && state != 15090 && state != 15091) { non_air++; }
+                if (!air_block(state)) { non_air++; }
             }
             sections.short(non_air);
             sections.byte(15);
@@ -341,13 +446,24 @@ fn apply_edits(chunk: Bytes, edits: []BlockChange) -> Bytes {
             }
             sections.append(chunk.data, biome_start, reader.offset - biome_start);
         }
+        if (len(edits) > 0) { heightmaps.add(section, states, materials); }
     }
     if (reader.offset != tail) { return null; }
     let result: Bytes = new Bytes(chunk.size + sections.size - sections_length);
-    result.append(chunk.data, 0, header);
+    if (len(edits) == 0) {
+        let header: Reader = new Reader(chunk.data, 0, chunk.size);
+        if (!skip_heightmaps(header)) { return null; }
+        result.append(chunk.data, 0, header.offset);
+    } else {
+        result.append(chunk.data, 0, 8);
+        heightmaps.write(result);
+    }
     result.varint(sections.size);
     result.append(sections.data, 0, sections.size);
-    if (!append_edited_entities(result, chunk, tail, edits)) { return null; }
+    let original_light: i32 = append_edited_entities(result, chunk, tail, edits);
+    if (original_light < 0) { return null; }
+    if (lighting == null) { result.append(chunk.data, original_light, chunk.size - original_light); }
+    else { result.append(lighting.data, 0, lighting.size); }
     return result;
 }
 
@@ -381,10 +497,10 @@ fn read_block(chunk: Bytes, x: i32, y: i32, z: i32) -> i32 {
     return states[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
 }
 
-fn append_edited_entities(result: Bytes, original: Bytes, tail: i32, edits: []BlockChange) -> bool {
+fn append_edited_entities(result: Bytes, original: Bytes, tail: i32, edits: []BlockChange) -> i32 {
     let reader: Reader = new Reader(original.data, tail, original.size);
     let total: i32 = reader.varint();
-    if (!reader.valid || total < 0 || total > 98304) { return false; }
+    if (!reader.valid || total < 0 || total > 98304) { return -1; }
     let entries: Bytes = new Bytes();
     let kept: i32 = 0;
     for (let index: i32 = 0; index < total; index++) {
@@ -395,7 +511,7 @@ fn append_edited_entities(result: Bytes, original: Bytes, tail: i32, edits: []Bl
         reader.varint();
         let tag: i32 = reader.byte();
         skip_nbt(reader, tag, 0);
-        if (!reader.valid) { return false; }
+        if (!reader.valid) { return -1; }
         let removed: bool = false;
         for (let edit: i32 = 0; edit < len(edits); edit++) {
             let change: BlockChange = edits[edit];
@@ -411,6 +527,71 @@ fn append_edited_entities(result: Bytes, original: Bytes, tail: i32, edits: []Bl
     }
     result.varint(kept);
     result.append(entries.data, 0, entries.size);
-    result.append(original.data, reader.offset, reader.left());
-    return true;
+    return reader.offset;
+}
+
+fn load_light_blocks(volume: LightVolume, chunk: Bytes, cx: i32, cz: i32) -> bool {
+    let reader: Reader = new Reader(chunk.data, 0, chunk.size);
+    if (!skip_heightmaps(reader)) { return false; }
+    let length: i32 = reader.varint();
+    if (!reader.valid || length < 0 || length > reader.left()) { return false; }
+    reader.end = reader.offset + length;
+    for (let section: i32 = 0; section < 24; section++) {
+        reader.short();
+        let start: i32 = reader.offset;
+        if (reader.byte() == 0) {
+            let state: i32 = reader.varint();
+            if (!reader.valid || state < 0 || state >= 29671) { return false; }
+            volume.fill_section(cx, cz, section, state);
+        } else {
+            reader.offset = start;
+            let states: []i32 = [];
+            read_palette(reader, 4096, 8, states, true);
+            if (!reader.valid || len(states) != 4096) { return false; }
+            volume.load_section(cx, cz, section, states);
+        }
+        read_palette(reader, 64, 3, [], false);
+        if (!reader.valid) { return false; }
+    }
+    return reader.offset == reader.end;
+}
+
+class Heightmaps {
+    let heights: str = alloc_string(3072);
+
+    pub init() { memset(ptr(self.heights), 0, 3072); }
+
+    pub fn add(section: i32, states: []i32, materials: str) -> void {
+        let base: u64 = ptr(self.heights);
+        for (let index: i32 = 0; index < 4096; index++) {
+            let state: i32 = states[index];
+            if (state < 0 || state >= 29671) { continue; }
+            let flags: i32 = byte_at(materials, state);
+            if ((flags & 4) != 0) { continue; }
+            let column: u64 = to_u64((index & 255) * 4);
+            let height: i32 = section * 16 + (index >> 8) + 1;
+            store32(base + column + 1024, height);
+            if ((flags & 1) != 0) {
+                store32(base + column, height);
+                if ((flags & 2) == 0) { store32(base + column + 2048, height); }
+            }
+        }
+    }
+
+    pub fn write(packet: Bytes) -> void {
+        packet.varint(3);
+        let kinds: []i32 = [4, 1, 5];
+        for (let kind: i32 = 0; kind < 3; kind++) {
+            packet.varint(kinds[kind]);
+            packet.varint(37);
+            for (let word: i32 = 0; word < 37; word++) {
+                let bits: i64 = 0;
+                for (let offset: i32 = 0; offset < 7 && word * 7 + offset < 256; offset++) {
+                    let height: i64 = to_i64(load32(ptr(self.heights) + to_u64(kind * 1024 + (word * 7 + offset) * 4)));
+                    bits = bits | (height << to_i64(offset * 9));
+                }
+                packet.long(bits);
+            }
+        }
+    }
 }

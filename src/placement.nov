@@ -1,0 +1,129 @@
+module placement;
+
+import ../lib/std;
+import wire;
+import connection;
+
+class Placement {
+    let states: Bytes;
+    let shapes: Bytes;
+    let rules: Bytes;
+    pub let ready: bool;
+
+    pub init() {
+        self.states = read_blob("data/placement-774.bin", 1048576);
+        self.shapes = read_blob("data/collision-774.bin", 1048576);
+        self.rules = read_blob("data/placement-rules-774.bin", 262144);
+        self.ready = self.states != null && self.shapes != null && self.rules != null && self.rules.size == 178026;
+    }
+
+    pub fn state(item: i32, default_state: i32, face: i32, player: Connection, hit_y: f64) -> i32 {
+        if (default_state < 1 || item < 1) { return -1; }
+        let reader: Reader = new Reader(self.states.data, item * 4, item * 4 + 4);
+        let table: i32 = reader.int32();
+        if (table < 0) { return default_state; }
+        let yaw: f64 = wire_float(player.yaw_bits);
+        let rotation: i32 = (floor_block(yaw / 90.0 + 0.5) & 3) * 4;
+        if ((table & 1) != 0) { rotation = floor_block(yaw / 22.5 + 0.5) & 15; }
+        let pitch: f64 = wire_float(player.pitch_bits);
+        let look: i32 = 2;
+        if (pitch > 45.0) { look = 0; }
+        else if (pitch < -45.0) { look = 1; }
+        let upper: i32 = 0;
+        if (hit_y > 0.5) { upper = 1; }
+        let offset: i32 = (table & ~1) + ((face * 16 + rotation) * 6 + look * 2 + upper) * 2;
+        let choice: Reader = new Reader(self.states.data, offset, offset + 2);
+        let value: i32 = choice.short();
+        if (value == 65535) { return -1; }
+        return value;
+    }
+
+    pub fn kind(state: i32) -> i32 {
+        if (state < 0 || state >= self.rules.size / 6) { return 0; }
+        return byte_at(self.rules.data, state * 6);
+    }
+
+    pub fn related_state(state: i32) -> i32 {
+        let at: i32 = state * 6 + 2;
+        return (byte_at(self.rules.data, at) << 8) | byte_at(self.rules.data, at + 1);
+    }
+
+    pub fn merge_slab(existing: i32, default_state: i32, face: i32, hit_y: f64, clicked: bool) -> i32 {
+        let kind: i32 = self.kind(existing);
+        if (kind != 4 && kind != 5) { return -1; }
+        let at: i32 = existing * 6 + 4;
+        if (((byte_at(self.rules.data, at) << 8) | byte_at(self.rules.data, at + 1)) != default_state) { return -1; }
+        if (clicked && ((kind == 4 && face != 0 && !(face >= 2 && hit_y <= 0.5)) ||
+            (kind == 5 && face != 1 && !(face >= 2 && hit_y > 0.5)))) { return -1; }
+        return self.related_state(existing);
+    }
+
+    pub fn supports(state: i32, face: i32) -> bool {
+        let offset: Reader = new Reader(self.shapes.data, state * 4, state * 4 + 4);
+        let geometry: Reader = new Reader(self.shapes.data, offset.int32(), self.shapes.size);
+        // Vanilla's CENTER support covers the middle two model units on the face.
+        let count: i32 = geometry.byte();
+        for (let index: i32 = 0; index < count; index++) {
+            let min_x: i32 = geometry.short(); let min_y: i32 = geometry.short(); let min_z: i32 = geometry.short();
+            let max_x: i32 = geometry.short(); let max_y: i32 = geometry.short(); let max_z: i32 = geometry.short();
+            let cover_x: bool = (min_x <= 1792 || min_x >= 32768) && max_x >= 2304;
+            let cover_y: bool = (min_y <= 1792 || min_y >= 32768) && max_y >= 2304;
+            let cover_z: bool = (min_z <= 1792 || min_z >= 32768) && max_z >= 2304;
+            if (face == 0 && (min_y == 0 || min_y >= 32768) && cover_x && cover_z) { return true; }
+            if (face == 1 && max_y >= 4096 && cover_x && cover_z) { return true; }
+            if (face == 2 && (min_z == 0 || min_z >= 32768) && cover_x && cover_y) { return true; }
+            if (face == 3 && max_z >= 4096 && cover_x && cover_y) { return true; }
+            if (face == 4 && (min_x == 0 || min_x >= 32768) && cover_y && cover_z) { return true; }
+            if (face == 5 && max_x >= 4096 && cover_y && cover_z) { return true; }
+        }
+        return false;
+    }
+
+    pub fn collision(state: i32, x: i32, y: i32, z: i32, player: Connection) -> bool {
+        let px: f64 = player.x - i64_to_f64(to_i64(x));
+        let py: f64 = player.y - i64_to_f64(to_i64(y));
+        let pz: f64 = player.z - i64_to_f64(to_i64(z));
+        if (px <= -0.55 || px >= 1.8 || py <= -2.05 || py >= 1.5 || pz <= -0.55 || pz >= 1.8) { return false; }
+        let box_height: f64 = 1.8;
+        if (player.crouching) { box_height = 1.5; }
+        let offset: Reader = new Reader(self.shapes.data, state * 4, state * 4 + 4);
+        let geometry: Reader = new Reader(self.shapes.data, offset.int32(), self.shapes.size);
+        let boxes: i32 = geometry.byte();
+        for (let index: i32 = 0; index < boxes; index++) {
+            let min_x: f64 = shape_coordinate(geometry);
+            let min_y: f64 = shape_coordinate(geometry);
+            let min_z: f64 = shape_coordinate(geometry);
+            let max_x: f64 = shape_coordinate(geometry);
+            let max_y: f64 = shape_coordinate(geometry);
+            let max_z: f64 = shape_coordinate(geometry);
+            if (min_x < px + 0.3 && max_x > px - 0.3 && min_y < py + box_height &&
+                max_y > py && min_z < pz + 0.3 && max_z > pz - 0.3) { return true; }
+        }
+        return false;
+    }
+}
+
+fn shape_coordinate(reader: Reader) -> f64 {
+    let value: i32 = reader.short();
+    if (value >= 32768) { value -= 65536; }
+    return i64_to_f64(to_i64(value)) / 4096.0;
+}
+
+fn wire_float(bits: i32) -> f64 {
+    let exponent: i32 = (bits >> 23) & 255;
+    if (exponent == 0) {
+        let fraction: f64 = i64_to_f64(to_i64(bits & 8388607)) * f64_from_bits(3936146074321813504); // 2^-149
+        if (bits < 0) { return -fraction; }
+        return fraction;
+    }
+    if (exponent == 255) {
+        let special: i64 = 9218868437227405312 | (to_i64(bits & 8388607) << 29);
+        if (bits < 0) { return -f64_from_bits(special); }
+        return f64_from_bits(special);
+    }
+    let mantissa: i64 = to_i64(bits & 8388607) << 29;
+    let magnitude: i64 = (to_i64(exponent + 896) << 52) | mantissa;
+    let value: f64 = f64_from_bits(magnitude);
+    if (bits < 0) { return -value; }
+    return value;
+}

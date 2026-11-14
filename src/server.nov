@@ -13,6 +13,7 @@ import world;
 import play;
 import items;
 import crafting;
+import placement;
 
 class Server {
     let settings: Settings;
@@ -20,7 +21,9 @@ class Server {
     let configuration: Bytes;
     let players: []Connection = [];
     let drops: []ItemDrop = [];
+    let light_updates: []ChunkPosition = [];
     let crafting: Crafting = new Crafting();
+    let placement: Placement = new Placement();
     let poller: PollSet = new PollSet(129);
     let next_id: i32 = 1;
     let running: bool = true;
@@ -33,10 +36,11 @@ class Server {
 
     pub init(options: Settings) {
         self.settings = options;
+        if (!self.placement.ready) { self.error = "Cannot load block placement data"; return; }
         if (!self.crafting.ready) { self.error = "Cannot load crafting recipes"; return; }
         self.configuration = read_blob("data/configuration-774.bin", 1048576);
         if (self.configuration == null) { self.error = "Cannot load protocol 774 registries. Run from the GolemMC checkout."; return; }
-        self.world = new World(options.world, options.source, options.seed);
+        self.world = new World(options.world, options.source, options.seed, options.generator);
         self.error = self.world.error;
     }
 
@@ -106,6 +110,7 @@ class Server {
                 player.finished_writing = true;
             }
         }
+        self.flush_lighting();
         self.tick_drops(now);
         if (now - self.updated >= 1000) { self.updated = now; }
         if (now - self.saved >= 30000) {
@@ -138,8 +143,22 @@ class Server {
             packet.long(now);
             player.send(43, packet);
         }
+        if (player.awaiting_terrain && !player.teleport_pending) {
+            let x: i32 = floor_block(player.destination_x) >> 4;
+            let z: i32 = floor_block(player.destination_z) >> 4;
+            if (self.world.has_chunk(x, z)) {
+                player.awaiting_terrain = false;
+                player.x = player.destination_x; player.y = player.destination_y; player.z = player.destination_z;
+                center_view(player, x, z, self.settings.view, false);
+                send_teleport(player);
+                self.sync_movement(player);
+            } else if (now - player.terrain_started >= 30000) {
+                player.awaiting_terrain = false;
+                send_message(player, "Terrain generation is taking longer than expected. Try moving again.");
+            } else { self.world.request_chunk(x, z); }
+        }
         if (now - self.updated >= 1000) { send_time(player, ticks); }
-        stream_chunks(player, self.world, self.settings.view, now);
+        stream_chunks(player, self.world, now);
     }
 
     fn player_count() -> i32 {
@@ -260,7 +279,7 @@ class Server {
         self.crafting.update(player);
         join_play(player, self.settings, self.world, ticks);
         player_info(player, player, self.settings.mode);
-        center_view(player, block_floor(player.x) >> 4, block_floor(player.z) >> 4, self.settings.view, true);
+        center_view(player, floor_block(player.x) >> 4, floor_block(player.z) >> 4, self.settings.view, true);
         for (let index: i32 = 0; index < len(self.players); index++) {
             let other: Connection = self.players[index];
             if (other == player || other.phase != 6 || other.closing) { continue; }
@@ -304,7 +323,7 @@ class Server {
             let reply: i64 = frame.long();
             if (frame.valid && frame.left() == 0 && reply == player.keepalive) { player.keepalive = 0; }
         } else if (id == 29 || id == 30 || id == 31 || id == 32) {
-            if (!player.teleport_pending) { self.move(player, frame, id); }
+            if (!player.teleport_pending) { self.move(player, frame, id, now); }
         } else if (id == 8) {
             let message: str = frame.string(256);
             if (frame.valid && printable(message)) { self.broadcast("<" + player.username + "> " + message); }
@@ -313,6 +332,9 @@ class Server {
             if (frame.valid) { self.command(command, player); }
         } else if (id == 17) {
             self.crafting.click(self.world, player, frame);
+        } else if (id == 42) {
+            let flags: i32 = frame.byte();
+            if (frame.valid && frame.left() == 0) { player.crouching = (flags & 32) != 0; }
         } else if (id == 52) {
             let slot: i32 = frame.short();
             if (slot >= 0 && slot < 9) { player.selected = slot; }
@@ -323,7 +345,7 @@ class Server {
         }
     }
 
-    fn move(player: Connection, frame: Reader, id: i32) -> void {
+    fn move(player: Connection, frame: Reader, id: i32, now: i64) -> void {
         let x: f64 = player.x;
         let y: f64 = player.y;
         let z: f64 = player.z;
@@ -331,19 +353,37 @@ class Server {
             x = frame.double(); y = frame.double(); z = frame.double();
         }
         if (id == 30 || id == 31) {
-            player.yaw_bits = frame.int32(); player.pitch_bits = frame.int32();
+            let yaw: i32 = frame.int32(); let pitch: i32 = frame.int32();
+            if (frame.valid && (yaw & 2139095040) != 2139095040 && (pitch & 2139095040) != 2139095040) {
+                let degrees: f64 = wire_float(yaw);
+                if (degrees >= -1000000000.0 && degrees <= 1000000000.0) {
+                    player.yaw_bits = yaw; player.pitch_bits = pitch;
+                }
+            }
         }
         let flags: i32 = frame.byte();
         if (!frame.valid || frame.left() != 0) { return; }
         if (!valid_location(x, y, z)) { send_teleport(player); return; }
-        let cx: i32 = block_floor(x) >> 4;
-        let cz: i32 = block_floor(z) >> 4;
+        let cx: i32 = floor_block(x) >> 4;
+        let cz: i32 = floor_block(z) >> 4;
         if ((cx != player.view_x || cz != player.view_z) && !self.world.has_chunk(cx, cz)) {
+            if (self.world.generating) {
+                if (!player.awaiting_terrain || cx != floor_block(player.destination_x) >> 4 ||
+                    cz != floor_block(player.destination_z) >> 4) { player.terrain_started = now; }
+                player.awaiting_terrain = true;
+                player.destination_x = x; player.destination_y = y; player.destination_z = z;
+                self.world.request_chunk(cx, cz);
+            }
             send_teleport(player);
             return;
         }
+        if (cx != player.view_x || cz != player.view_z) { player.awaiting_terrain = false; }
         player.x = x; player.y = y; player.z = z; player.ground = (flags & 1) != 0;
         center_view(player, cx, cz, self.settings.view, false);
+        self.sync_movement(player);
+    }
+
+    fn sync_movement(player: Connection) -> void {
         for (let index: i32 = 0; index < len(self.players); index++) {
             let other: Connection = self.players[index];
             if (other != player && other.phase == 6 && !other.closing) { sync_player(other, player); }
@@ -377,12 +417,18 @@ class Server {
         let y: i32 = to_i32((bits << 52) >> 52);
         let z: i32 = to_i32((bits << 26) >> 38);
         let face: i32 = 0;
+        let hit_y: f64 = 0.5;
         if (id == 40) { face = frame.byte(); }
-        else { face = frame.varint(); frame.skip(14); }
+        else {
+            face = frame.varint();
+            frame.skip(4);
+            hit_y = wire_float(frame.int32());
+            frame.skip(6);
+        }
         let sequence: i32 = frame.varint();
         if (!frame.valid || frame.left() != 0 || sequence < 0 || face < 0 || face > 5) { return; }
         if (id == 40) { self.mine(player, x, y, z, action, now); }
-        else if (action == 0 || action == 1) { self.place(player, x, y, z, face, action); }
+        else if (action == 0 || action == 1) { self.place(player, x, y, z, face, action, hit_y); }
         confirm_edit(player, sequence);
     }
 
@@ -392,7 +438,7 @@ class Server {
         let state: i32 = self.world.block(x, y, z);
         if (state <= 0 || state == 15090 || state == 15091) { return; }
         if (self.settings.mode == 1) {
-            if (action == 0 && self.world.set_block(x, y, z, 0)) { self.notify_block(x, y, z, 0); }
+            if (action == 0) { self.break_block(x, y, z, state); }
             return;
         }
         let duration: i32 = self.world.mining_time(state);
@@ -407,8 +453,7 @@ class Server {
         let finished: bool = player.digging && player.dig_x == x && player.dig_y == y &&
             player.dig_z == z && player.dig_state == state && now - player.dig_started >= to_i64(duration);
         player.digging = false;
-        if (!finished || !self.world.set_block(x, y, z, 0)) { update_block(player, x, y, z, state); return; }
-        self.notify_block(x, y, z, 0);
+        if (!finished || !self.break_block(x, y, z, state)) { update_block(player, x, y, z, state); return; }
         let item: i32 = self.world.drop_item(state);
         if (item > 0 && len(self.drops) < 1024) {
             let drop: ItemDrop = new ItemDrop(self.next_id, x, y, z, item, now);
@@ -421,24 +466,66 @@ class Server {
         }
     }
 
-    fn place(player: Connection, x: i32, y: i32, z: i32, face: i32, hand: i32) -> void {
-        if (!in_reach(player, x, y, z)) { return; }
-        if (face == 0) { y--; }
-        else if (face == 1) { y++; }
-        else if (face == 2) { z--; }
-        else if (face == 3) { z++; }
-        else if (face == 4) { x--; }
-        else { x++; }
+    fn break_block(x: i32, y: i32, z: i32, state: i32) -> bool {
+        if (!self.world.set_block(x, y, z, 0)) { return false; }
+        self.notify_block(x, y, z, 0, state);
+        let kind: i32 = self.placement.kind(state);
+        if (kind == 2 || kind == 3) {
+            let other_y: i32 = y + 1;
+            if (kind == 3) { other_y = y - 1; }
+            let other: i32 = self.world.block(x, other_y, z);
+            if (other == self.placement.related_state(state) && self.world.set_block(x, other_y, z, 0)) {
+                self.notify_block(x, other_y, z, 0, other);
+            }
+        }
+        return true;
+    }
+
+    fn place(player: Connection, x: i32, y: i32, z: i32, face: i32, hand: i32, hit_y: f64) -> void {
+        if (!in_reach(player, x, y, z) || !(hit_y >= 0.0 && hit_y <= 1.0)) { return; }
+        let support: i32 = self.world.block(x, y, z);
+        if (support < 0 || air_block(support)) { return; }
         let slot: i32 = 36 + player.selected;
         if (hand == 1) { slot = 45; }
-        let state: i32 = self.world.block_for_item(player.items[slot]);
-        let old: i32 = self.world.block(x, y, z);
-        if (state < 1 || player.amounts[slot] < 1 || (old != 0 && old != 15090 && old != 15091)) {
+        let item: i32 = player.items[slot];
+        let default_state: i32 = self.world.block_for_item(item);
+        let state: i32 = self.placement.merge_slab(support, default_state, face, hit_y, true);
+        let old: i32 = support;
+        if (state < 0) {
+            if (face == 0) { y--; }
+            else if (face == 1) { y++; }
+            else if (face == 2) { z--; }
+            else if (face == 3) { z++; }
+            else if (face == 4) { x--; }
+            else { x++; }
+            old = self.world.block(x, y, z);
+            if (air_block(old)) { state = self.placement.state(item, default_state, face, player, hit_y); }
+            else { state = self.placement.merge_slab(old, default_state, face, hit_y, false); }
+        }
+        let kind: i32 = self.placement.kind(state);
+        if (state < 1 || player.amounts[slot] < 1 || old < 0 ||
+            (kind == 1 && !self.placement.supports(support, face)) || self.placement_blocked(state, x, y, z)) {
             if (old >= 0) { update_block(player, x, y, z, old); }
             return;
         }
-        if (!self.world.set_block(x, y, z, state)) { return; }
-        self.notify_block(x, y, z, state);
+        if (kind == 2) {
+            let upper: i32 = self.placement.related_state(state);
+            let top: i32 = self.world.block(x, y + 1, z);
+            let below: i32 = self.world.block(x, y - 1, z);
+            if (y >= 319 || !air_block(top) || below <= 0 || !self.placement.supports(below, 1) ||
+                self.placement_blocked(upper, x, y + 1, z)) {
+                update_block(player, x, y, z, old);
+                if (top >= 0) { update_block(player, x, y + 1, z, top); }
+                return;
+            }
+            if (!self.world.set_block(x, y + 1, z, upper)) { return; }
+            if (!self.world.set_block(x, y, z, state)) {
+                self.world.set_block(x, y + 1, z, top);
+                return;
+            }
+            self.notify_block(x, y + 1, z, upper, top);
+        } else if (!self.world.set_block(x, y, z, state)) { return; }
+        self.notify_block(x, y, z, state, old);
         if (self.settings.mode == 0) {
             player.amounts[slot]--;
             if (player.amounts[slot] == 0) { player.items[slot] = 0; }
@@ -446,11 +533,53 @@ class Server {
         }
     }
 
-    fn notify_block(x: i32, y: i32, z: i32, state: i32) -> void {
+    fn placement_blocked(state: i32, x: i32, y: i32, z: i32) -> bool {
+        for (let index: i32 = 0; index < len(self.players); index++) {
+            let player: Connection = self.players[index];
+            if (player.phase == 6 && !player.closing && self.placement.collision(state, x, y, z, player)) { return true; }
+        }
+        return false;
+    }
+
+    fn notify_block(x: i32, y: i32, z: i32, state: i32, before: i32) -> void {
+        if (self.world.light_changed(before, state)) {
+            for (let cz: i32 = (z - 14) >> 4; cz <= (z + 14) >> 4; cz++) {
+                for (let cx: i32 = (x - 14) >> 4; cx <= (x + 14) >> 4; cx++) {
+                    self.queue_lighting(cx, cz);
+                }
+            }
+        }
         for (let index: i32 = 0; index < len(self.players); index++) {
             let other: Connection = self.players[index];
-            if (other.phase == 6 && !other.closing && within(x >> 4, other.view_x, self.settings.view) &&
-                within(z >> 4, other.view_z, self.settings.view)) { update_block(other, x, y, z, state); }
+            if (other.phase == 6 && !other.closing && other.has_sent(x >> 4, z >> 4)) { update_block(other, x, y, z, state); }
+        }
+    }
+
+    fn queue_lighting(x: i32, z: i32) -> void {
+        for (let index: i32 = 0; index < len(self.light_updates); index++) {
+            let chunk: ChunkPosition = self.light_updates[index];
+            if (chunk.x == x && chunk.z == z) { return; }
+        }
+        array_append(self.light_updates, new ChunkPosition(x, z));
+    }
+
+    fn flush_lighting() -> void {
+        while (len(self.light_updates) > 0) {
+            let chunk: ChunkPosition = array_pop(self.light_updates);
+            let packet: Bytes = null;
+            for (let index: i32 = 0; index < len(self.players); index++) {
+                let player: Connection = self.players[index];
+                if (player.phase != 6 || player.closing || !player.has_sent(chunk.x, chunk.z)) { continue; }
+                if (packet == null) {
+                    let light: Bytes = self.world.lighting(chunk.x, chunk.z);
+                    if (light == null) { break; }
+                    packet = new Bytes(light.size + 10);
+                    packet.varint(chunk.x); packet.varint(chunk.z);
+                    packet.append(light.data, 0, light.size);
+                }
+                player.send(47, packet);
+            }
+            if (packet != null) { return; }
         }
     }
 
@@ -521,6 +650,7 @@ class Server {
                 if (!member.closing && member.phase == 6) { message = message + " " + member.username; }
             }
         } else if (command == "spawn" && player != null) {
+            player.awaiting_terrain = false;
             player.x = i64_to_f64(to_i64(self.world.spawn_x)) + 0.5;
             player.y = i64_to_f64(to_i64(self.world.spawn_y));
             player.z = i64_to_f64(to_i64(self.world.spawn_z)) + 0.5;

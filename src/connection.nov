@@ -4,6 +4,12 @@ import ../lib/std;
 import ../lib/socket;
 import wire;
 
+class ChunkPosition {
+    pub let x: i32;
+    pub let z: i32;
+    pub init(x: i32, z: i32) { self.x = x; self.z = z; }
+}
+
 class Connection {
     pub let fd: i32;
     pub let phase: i32 = 0;
@@ -22,12 +28,22 @@ class Connection {
     pub let yaw_bits: i32 = 0;
     pub let pitch_bits: i32 = 0;
     pub let ground: bool = false;
+    pub let crouching: bool = false;
     pub let view_x: i32 = 0;
     pub let view_z: i32 = 0;
     pub let streaming: bool = false;
+    pub let view_chunks: []ChunkPosition = [];
+    pub let sent_chunks: []ChunkPosition = [];
     pub let next_chunk: i32 = 0;
+    pub let missing_chunks: bool = false;
+    pub let next_missing: i64 = 0;
     pub let teleport: i32 = 0;
     pub let teleport_pending: bool = false;
+    pub let awaiting_terrain: bool = false;
+    pub let destination_x: f64 = 0.0;
+    pub let destination_y: f64 = 0.0;
+    pub let destination_z: f64 = 0.0;
+    pub let terrain_started: i64 = 0;
     pub let next_batch: i64 = 0;
     pub let keepalive: i64 = 0;
     pub let last_keepalive: i64 = 0;
@@ -53,6 +69,14 @@ class Connection {
         self.fd = fd;
         self.touched = now;
         self.last_keepalive = now;
+    }
+
+    pub fn has_sent(x: i32, z: i32) -> bool {
+        for (let index: i32 = 0; index < len(self.sent_chunks); index++) {
+            let chunk: ChunkPosition = self.sent_chunks[index];
+            if (chunk.x == x && chunk.z == z) { return true; }
+        }
+        return false;
     }
 
     pub fn receive(now: i64) -> bool {

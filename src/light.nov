@@ -1,0 +1,195 @@
+module light;
+
+import ../lib/std;
+import wire;
+
+// A 3x3 chunk volume provides a 16-block border for propagation into the
+// middle chunk. No light step can travel more than 14 blocks from a source.
+class LightVolume {
+    let opacity: str = alloc_string(884736);
+    let sky: str = alloc_string(884736);
+    let block: str = alloc_string(884736);
+    let rules: str;
+
+    pub init(rules: str) {
+        self.rules = rules;
+        memset(ptr(self.opacity), 15, 884736);
+        memset(ptr(self.block), 0, 884736);
+    }
+
+    pub fn fill_flat(cx: i32, cz: i32) -> void {
+        self.fill_section(cx, cz, 0, 0);
+        for (let y: i32 = 0; y < 4; y++) {
+            for (let z: i32 = 0; z < 16; z++) {
+                let index: u64 = to_u64((y * 48 + cz * 16 + z) * 48 + cx * 16);
+                memset(ptr(self.opacity) + index, 15, 16);
+            }
+        }
+        for (let section: i32 = 1; section < 24; section++) { self.fill_section(cx, cz, section, 0); }
+    }
+
+    pub fn fill_section(cx: i32, cz: i32, section: i32, state: i32) -> void {
+        let state_opacity: i32 = load8(ptr(self.rules) + to_u64(state * 2));
+        let emission: i32 = load8(ptr(self.rules) + to_u64(state * 2 + 1));
+        for (let y: i32 = section * 16; y < section * 16 + 16; y++) {
+            for (let z: i32 = 0; z < 16; z++) {
+                let index: u64 = to_u64((y * 48 + cz * 16 + z) * 48 + cx * 16);
+                memset(ptr(self.opacity) + index, state_opacity, 16);
+                if (emission > 0) { memset(ptr(self.block) + index, emission, 16); }
+            }
+        }
+    }
+
+    pub fn set(x: i32, y: i32, z: i32, state: i32) -> void {
+        if (state < 0 || state >= 29671) { return; }
+        let index: i32 = (y * 48 + z) * 48 + x;
+        let rule: u64 = ptr(self.rules) + to_u64(state * 2);
+        string_set_byte(self.opacity, index, load8(rule));
+        string_set_byte(self.block, index, load8(rule + 1));
+    }
+
+    pub fn load_section(cx: i32, cz: i32, section: i32, states: []i32) -> void {
+        for (let index: i32 = 0; index < 4096; index++) {
+            self.set(cx * 16 + (index & 15), section * 16 + (index >> 8), cz * 16 + ((index >> 4) & 15), states[index]);
+        }
+    }
+
+    pub fn calculate() -> Bytes {
+        let opacity: u64 = ptr(self.opacity);
+        let sky: u64 = ptr(self.sky);
+        for (let column: i32 = 0; column < 2304; column++) {
+            let amount: i32 = 15;
+            let cell: i32 = 882432 + column;
+            while (cell >= 0) {
+                let loss: i32 = load8(opacity + to_u64(cell));
+                if (amount < 15 && loss == 0) { loss = 1; }
+                amount -= loss;
+                if (amount < 0) { amount = 0; }
+                store8(sky + to_u64(cell), amount);
+                cell -= 2304;
+            }
+        }
+        propagate_light(sky, opacity, true);
+        propagate_light(ptr(self.block), opacity, false);
+        return pack_lighting(self.sky, self.block);
+    }
+}
+
+class LightQueue {
+    let entries: []i32 = [];
+    pub fn push(cell: i32) -> void { array_append(self.entries, cell); }
+    pub fn take() -> i32 {
+        if (len(self.entries) == 0) { return -1; }
+        return array_pop(self.entries);
+    }
+}
+
+fn propagate_light(light: u64, opacity: u64, sky: bool) -> void {
+    let queues: []LightQueue = [];
+    for (let level: i32 = 0; level < 16; level++) { array_append(queues, new LightQueue()); }
+    for (let cell: i32 = 0; cell < 884736; cell++) {
+        let amount: i32 = load8(light + to_u64(cell));
+        if (amount <= 1) { continue; }
+        if (!sky || adjacent_dark(light, cell, amount)) { queues[amount].push(cell); }
+    }
+    for (let level: i32 = 15; level > 1; level--) {
+        let cell: i32 = queues[level].take();
+        while (cell >= 0) {
+            if (load8(light + to_u64(cell)) == level) {
+                let x: i32 = cell % 48;
+                let z: i32 = (cell / 48) % 48;
+                if (x > 0) { light_step(light, opacity, queues, cell - 1, level); }
+                if (x < 47) { light_step(light, opacity, queues, cell + 1, level); }
+                if (z > 0) { light_step(light, opacity, queues, cell - 48, level); }
+                if (z < 47) { light_step(light, opacity, queues, cell + 48, level); }
+                if (cell >= 2304) { light_step(light, opacity, queues, cell - 2304, level); }
+                if (cell < 882432) { light_step(light, opacity, queues, cell + 2304, level); }
+            }
+            cell = queues[level].take();
+        }
+    }
+}
+
+fn adjacent_dark(light: u64, cell: i32, amount: i32) -> bool {
+    let x: i32 = cell % 48;
+    let z: i32 = (cell / 48) % 48;
+    let next: i32 = amount - 1;
+    return (x > 0 && load8(light + to_u64(cell - 1)) < next) ||
+        (x < 47 && load8(light + to_u64(cell + 1)) < next) ||
+        (z > 0 && load8(light + to_u64(cell - 48)) < next) ||
+        (z < 47 && load8(light + to_u64(cell + 48)) < next) ||
+        (cell >= 2304 && load8(light + to_u64(cell - 2304)) < next);
+}
+
+fn light_step(light: u64, opacity: u64, queues: []LightQueue, cell: i32, level: i32) -> void {
+    let address: u64 = to_u64(cell);
+    let loss: i32 = load8(opacity + address);
+    if (loss == 0) { loss = 1; }
+    let next: i32 = level - loss;
+    if (next <= 0 || load8(light + address) >= next) { return; }
+    store8(light + address, next);
+    if (next > 1) { queues[next].push(cell); }
+}
+
+class LightLayers {
+    pub let filled: i64 = 0;
+    pub let empty: i64 = 0;
+    pub let arrays: []str = [];
+
+    pub fn layer(section: i32, values: str) -> void {
+        let any_light: bool = false;
+        for (let index: i32 = 0; index < 2048; index++) {
+            if (byte_at(values, index) != 0) { any_light = true; break; }
+        }
+        let bit: i64 = to_i64(1) << to_i64(section);
+        if (any_light) { self.filled = self.filled | bit; array_append(self.arrays, values); }
+        else { self.empty = self.empty | bit; }
+    }
+
+    pub fn write(packet: Bytes) -> void {
+        packet.varint(len(self.arrays));
+        for (let index: i32 = 0; index < len(self.arrays); index++) {
+            packet.varint(2048);
+            packet.append(self.arrays[index], 0, 2048);
+        }
+    }
+}
+
+fn put_light_mask(packet: Bytes, mask: i64) -> void {
+    if (mask == 0) { packet.varint(0); }
+    else { packet.varint(1); packet.long(mask); }
+}
+
+fn pack_lighting(sky: str, block: str) -> Bytes {
+    let sky_layers: LightLayers = new LightLayers();
+    let block_layers: LightLayers = new LightLayers();
+    sky_layers.empty = 1;
+    block_layers.empty = 33554433; // outside the build-height range
+    for (let section: i32 = 0; section < 24; section++) {
+        sky_layers.layer(section + 1, pack_light_section(sky, section));
+        block_layers.layer(section + 1, pack_light_section(block, section));
+    }
+    let top: str = alloc_string(2048);
+    memset(ptr(top), 255, 2048);
+    sky_layers.layer(25, top);
+    let packet: Bytes = new Bytes(65536);
+    put_light_mask(packet, sky_layers.filled); put_light_mask(packet, block_layers.filled);
+    put_light_mask(packet, sky_layers.empty); put_light_mask(packet, block_layers.empty);
+    sky_layers.write(packet); block_layers.write(packet);
+    return packet;
+}
+
+fn pack_light_section(light: str, section: i32) -> str {
+    let values: str = alloc_string(2048);
+    for (let y: i32 = 0; y < 16; y++) {
+        for (let z: i32 = 0; z < 16; z++) {
+            let address: u64 = ptr(light) + to_u64(((section * 16 + y) * 48 + 16 + z) * 48 + 16);
+            for (let index: i32 = 0; index < 8; index++) {
+                let first: i32 = load8(address + to_u64(index * 2));
+                let second: i32 = load8(address + to_u64(index * 2 + 1));
+                string_set_byte(values, (y * 16 + z) * 8 + index, first | (second << 4));
+            }
+        }
+    }
+    return values;
+}

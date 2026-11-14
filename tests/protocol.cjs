@@ -177,8 +177,8 @@ test('status, concurrent play, movement, chat, chunk streaming, edits and restar
     assert.match((await packet(duplicate, 'disconnect')).reason, /username is already connected/)
 
 
-    const moved = packet(alice, 'sync_entity_position', p => p.entityId === bobEntity.entityId && p.x === 1.75)
-    bob.write('position', { x: 1.75, y: -60, z: 0.5, flags: { onGround: true } })
+    const moved = packet(alice, 'sync_entity_position', p => p.entityId === bobEntity.entityId && p.x === 2.75)
+    bob.write('position', { x: 2.75, y: -60, z: 0.5, flags: { onGround: true } })
     await moved
 
     const response = packet(bob, 'system_chat', p => p.content.value === 'Seed: 0')
@@ -234,8 +234,9 @@ test('survival mines, picks up and spends block items', { timeout: 15000 }, asyn
   try {
     server = await start(directory, 'gamemode=survival\n')
     bot = client(server.port, 'Miner')
+    const center = packet(bot, 'map_chunk', p => p.x === 0 && p.z === 0)
     assert.equal((await packet(bot, 'login')).worldState.gamemode, 'survival')
-    await packet(bot, 'map_chunk', p => p.x === 0 && p.z === 0)
+    await center
     const target = { x: 1, y: -61, z: 0 }
     const dig = (status, sequence, location = target) => bot.write('block_dig', { status, location, face: 1, sequence })
     const early = packet(bot, 'block_change', p => p.location.x === 1)
@@ -368,6 +369,201 @@ test('vanilla snapshot payloads remain byte-identical and edits persist separate
     const edited = await packet(bot, 'map_chunk', p => p.x === chunkX && p.z === chunkZ)
     assert.equal(blockAt(edited, worldX & 15, targetY, worldZ & 15), 0)
     assert.deepEqual(snapshotBytes, fs.readFileSync(chunkFile))
+  } finally {
+    await disconnect(bot)
+    await stop(server)
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+function stateWith (name, values) {
+  const block = requireTool('minecraft-data')('1.21.11').blocksByName[name]
+  let result = block.defaultState - block.minStateId
+  let stride = 1
+  for (const property of [...block.states].reverse()) {
+    if (Object.hasOwn(values, property.name)) {
+      const index = (property.values || ['true', 'false']).indexOf(values[property.name])
+      assert.ok(index >= 0)
+      result += (index - (Math.floor(result / stride) % property.num_values)) * stride
+    }
+    stride *= property.num_values
+  }
+  return result + block.minStateId
+}
+
+function equip (bot, name) {
+  const item = requireTool('minecraft-data')('1.21.11').itemsByName[name]
+  bot.write('set_creative_slot', {
+    slot: 36, item: { itemCount: 1, itemId: item.id, addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: [] }
+  })
+}
+
+function place (bot, x, y, z, face, sequence, cursorY = 0.5) {
+  bot.write('block_place', {
+    hand: 0, location: { x, y, z }, direction: face, cursorX: 0.5, cursorY, cursorZ: 0.5,
+    insideBlock: false, worldBorderHit: false, sequence
+  })
+}
+
+function dig (bot, x, y, z, sequence) {
+  bot.write('block_dig', { status: 0, location: { x, y, z }, face: 1, sequence })
+}
+
+function lightAt (packet, sky, x, y, z) {
+  const prefix = sky ? 'sky' : 'block'
+  const section = ((y + 64) >> 4) + 1
+  const mask = BigInt(packet[prefix + 'LightMask'][0] || 0)
+  if (((mask >> BigInt(section)) & 1n) === 0n) return 0
+  let arrayIndex = 0
+  for (let index = 0; index < section; index++) arrayIndex += Number((mask >> BigInt(index)) & 1n)
+  const data = packet[prefix + 'Light'][arrayIndex]
+  const offset = ((y & 15) * 16 + (z & 15)) * 8 + ((x & 15) >> 1)
+  return (data[offset] >> ((x & 1) * 4)) & 15
+}
+
+test('placement checks player collision and uses the clicked face, yaw, and hit height', { timeout: 25000 }, async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'golem-placement-'))
+  let server
+  let builder
+  let neighbor
+  try {
+    server = await start(directory)
+    builder = client(server.port, 'Builder')
+    const center = packet(builder, 'map_chunk', p => p.x === 0 && p.z === 0)
+    await center
+    let sequence = 0
+    async function check (name, source, face, target, expected, cursorY) {
+      equip(builder, name)
+      const changed = packet(builder, 'block_change', p =>
+        p.location.x === target[0] && p.location.y === target[1] && p.location.z === target[2])
+      place(builder, ...source, face, ++sequence, cursorY)
+      assert.equal((await changed).type, expected)
+    }
+    await check('stone', [0, -61, 0], 1, [0, -60, 0], 0)
+    await check('stone', [1, -61, 0], 1, [1, -60, 0], stateWith('stone', {}))
+    builder.write('look', { yaw: 90, pitch: 0, flags: { onGround: true } })
+    await check('stone_button', [0, -61, 0], 1, [0, -60, 0], stateWith('stone_button', { face: 'floor', facing: 'west' }))
+    await check('stone_button', [1, -60, 0], 5, [2, -60, 0], stateWith('stone_button', { face: 'wall', facing: 'east' }))
+    await check('stone_button', [1, -60, 0], 2, [1, -60, -1], stateWith('stone_button', { face: 'wall', facing: 'north' }))
+    await check('oak_log', [1, -60, 0], 3, [1, -60, 1], stateWith('oak_log', { axis: 'z' }))
+    await check('torch', [1, -60, 1], 5, [2, -60, 1], stateWith('wall_torch', { facing: 'east' }))
+    await check('furnace', [0, -61, 1], 1, [0, -60, 1], stateWith('furnace', { facing: 'east' }))
+    await check('oak_stairs', [1, -60, 0], 1, [1, -59, 0], stateWith('oak_stairs', { facing: 'west', half: 'bottom' }))
+    await check('stone_slab', [1, -60, 1], 3, [1, -60, 2], stateWith('stone_slab', { type: 'top' }), 0.75)
+    await check('stone_slab', [1, -60, 2], 0, [1, -60, 2], stateWith('stone_slab', { type: 'double' }))
+    const upper = packet(builder, 'block_change', p => p.location.x === -1 && p.location.y === -59 && p.location.z === 0)
+    await check('oak_door', [-1, -61, 0], 1, [-1, -60, 0], stateWith('oak_door', { facing: 'west', half: 'lower' }))
+    assert.equal((await upper).type, stateWith('oak_door', { facing: 'west', half: 'upper' }))
+    const lowerGone = packet(builder, 'block_change', p => p.location.x === -1 && p.location.y === -60 && p.type === 0)
+    dig(builder, -1, -59, 0, ++sequence)
+    await lowerGone
+
+    const present = packet(builder, 'spawn_entity')
+    neighbor = client(server.port, 'Neighbor')
+    await present
+    const moved = packet(builder, 'sync_entity_position', p => p.x === 2.5)
+    neighbor.write('position', { x: 2.5, y: -60, z: 2.5, flags: { onGround: true } })
+    await moved
+    await check('stone', [2, -61, 2], 1, [2, -60, 2], 0)
+  } finally {
+    await disconnect(neighbor)
+    await disconnect(builder)
+    await stop(server)
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('lighting follows edits across a chunk boundary, movement, and restart', { timeout: 25000 }, async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'golem-light-'))
+  let server
+  let bot
+  try {
+    server = await start(directory)
+    bot = client(server.port, 'Lights')
+    const neighbor = packet(bot, 'map_chunk', p => p.x === 1 && p.z === 0)
+    await neighbor
+    const seen = []
+    bot.on('map_chunk', p => seen.push([p.x, p.z]))
+    const view = packet(bot, 'update_view_position', p => p.chunkX === 1)
+    const unlocked = packet(bot, 'map_chunk', p => p.x === 3 && p.z === 0)
+    bot.write('position', { x: 16.5, y: -60, z: 0.5, flags: { onGround: true } })
+    await view
+    await unlocked
+    assert.equal(seen.some(([x, z]) => x === 0 && z === 0), false, 'loaded chunks should not be resent')
+    equip(bot, 'glowstone')
+    const emitted = packet(bot, 'update_light', p => p.chunkX === 1 && p.chunkZ === 0 && lightAt(p, false, 0, -60, 2) === 14)
+    place(bot, 15, -61, 2, 1, 1)
+    await emitted
+    const removed = packet(bot, 'update_light', p => p.chunkX === 1 && p.chunkZ === 0 && lightAt(p, false, 0, -60, 2) === 0)
+    dig(bot, 15, -60, 2, 2)
+    await removed
+
+    equip(bot, 'stone')
+    const shaded = packet(bot, 'update_light', p => p.chunkX === 0 && p.chunkZ === 0 && lightAt(p, true, 15, -60, 2) === 0)
+    place(bot, 15, -61, 2, 1, 3)
+    await shaded
+    const restored = packet(bot, 'update_light', p => p.chunkX === 0 && p.chunkZ === 0 && lightAt(p, true, 15, -60, 2) === 15)
+    dig(bot, 15, -60, 2, 4)
+    await restored
+
+    equip(bot, 'glowstone')
+    const stored = packet(bot, 'block_change', p => p.location.x === 15 && p.location.z === 2 && p.type === 6815)
+    place(bot, 15, -61, 2, 1, 5)
+    await stored
+    await disconnect(bot)
+    await stop(server)
+    server = await start(directory)
+    bot = client(server.port, 'Lights')
+    const sourceChunk = packet(bot, 'map_chunk', p => p.x === 0 && p.z === 0)
+    const adjacent = await packet(bot, 'map_chunk', p => p.x === 1 && p.z === 0)
+    assert.equal(lightAt(adjacent, false, 0, -60, 2), 14)
+    const source = await sourceChunk
+    const surface = source.heightmaps.find(h => h.type === 'world_surface').data
+    const column = 2 * 16 + 15
+    assert.equal((BigInt(surface[Math.floor(column / 7)]) >> BigInt((column % 7) * 9)) & 511n, 5n)
+  } finally {
+    await disconnect(bot)
+    await stop(server)
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('vanilla worldgen produces uncached Overworld terrain when requested', {
+  timeout: 60000,
+  skip: !process.env.GOLEM_GENERATOR
+}, async () => {
+  const worker = path.resolve(root, process.env.GOLEM_GENERATOR)
+  const [, seed] = fs.readFileSync(path.join(worker, 'snapshot.txt'), 'utf8').trim().split(' ')
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'golem-worldgen-'))
+  let server
+  let bot
+  try {
+    server = await start(directory, 'level-seed=' + seed + '\nvanilla-worldgen=' + worker + '\n')
+    bot = client(server.port, 'Explorer')
+    const login = packet(bot, 'login')
+    const initialPosition = packet(bot, 'position')
+    assert.equal((await login).worldState.isFlat, false)
+
+    const cx = Number(process.env.GOLEM_WORLDGEN_X || 200)
+    const cz = Number(process.env.GOLEM_WORLDGEN_Z || -200)
+    const file = path.join(worker, 'chunks', cx + '.' + cz + '.bin')
+    assert.equal(fs.existsSync(file), false, 'use a fresh generator or a different target')
+    const target = { x: cx * 16 + 8.5, y: 160, z: cz * 16 + 8.5, flags: { onGround: false } }
+    const spawn = await initialPosition
+    const waiting = packet(bot, 'position', p => p.teleportId > spawn.teleportId && p.x === spawn.x)
+    const arrived = packet(bot, 'position', p => p.x === target.x && p.z === target.z)
+    let rawChunk
+    bot.on('packet', (p, meta, raw) => {
+      if (meta.name === 'map_chunk' && p.x === cx && p.z === cz) rawChunk = raw
+    })
+    const received = packet(bot, 'map_chunk', p => p.x === cx && p.z === cz)
+    bot.write('position', target)
+    await Promise.all([waiting, arrived, received])
+    const p = await received
+    assert.ok(fs.existsSync(file), 'vanilla did not generate the requested coordinate')
+    assert.deepEqual(rawChunk.subarray(1), fs.readFileSync(file))
+    assert.ok(p.heightmaps.length > 0)
+    assert.notEqual(blockAt(p, 7, 0, 7), 0)
   } finally {
     await disconnect(bot)
     await stop(server)

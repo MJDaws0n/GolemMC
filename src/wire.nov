@@ -5,6 +5,12 @@ import ../lib/file_io;
 import ../lib/darwin;
 
 
+fn floor_block(value: f64) -> i32 {
+    let rounded: i32 = to_i32(value);
+    if (value < i64_to_f64(to_i64(rounded))) { return rounded - 1; }
+    return rounded;
+}
+
 class Bytes {
     pub let data: str;
     pub let size: i32 = 0;

@@ -168,45 +168,60 @@ fn within(value: i32, center: i32, distance: i32) -> bool {
 }
 
 fn center_view(player: Connection, x: i32, z: i32, distance: i32, first: bool) -> void {
-    let previous_x: i32 = player.view_x;
-    let previous_z: i32 = player.view_z;
-    if (!first && previous_x == x && previous_z == z) { return; }
+    if (!first && player.view_x == x && player.view_z == z) { return; }
+    let kept: []ChunkPosition = [];
     player.view_x = x;
     player.view_z = z;
     player.streaming = true;
     player.next_chunk = 0;
+    player.next_missing = 0;
+    player.missing_chunks = false;
     let center: Bytes = new Bytes();
     center.varint(x); center.varint(z);
     player.send(92, center);
-    if (first) { return; }
-    for (let dz: i32 = -distance; dz <= distance; dz++) {
-        for (let dx: i32 = -distance; dx <= distance; dx++) {
-            let cx: i32 = previous_x + dx;
-            let cz: i32 = previous_z + dz;
-            if (!within(cx, x, distance) || !within(cz, z, distance)) {
-                let packet: Bytes = new Bytes();
-                packet.int32(cz); packet.int32(cx);
-                player.send(37, packet);
+    for (let index: i32 = 0; index < len(player.sent_chunks); index++) {
+        let chunk: ChunkPosition = player.sent_chunks[index];
+        if (within(chunk.x, x, distance) && within(chunk.z, z, distance)) {
+            array_append(kept, chunk);
+        } else {
+            let packet: Bytes = new Bytes();
+            packet.int32(chunk.z); packet.int32(chunk.x);
+            player.send(37, packet);
+        }
+    }
+    player.sent_chunks = kept;
+    let view: []ChunkPosition = [new ChunkPosition(x, z)];
+    for (let ring: i32 = 1; ring <= distance; ring++) {
+        for (let dz: i32 = -ring; dz <= ring; dz++) {
+            for (let dx: i32 = -ring; dx <= ring; dx++) {
+                if (dx == -ring || dx == ring || dz == -ring || dz == ring) {
+                    array_append(view, new ChunkPosition(x + dx, z + dz));
+                }
             }
         }
     }
+    player.view_chunks = view;
 }
 
-fn stream_chunks(player: Connection, level: World, distance: i32, now: i64) -> void {
-    if (!player.streaming || player.waiting() >= 262144 || now < player.next_batch) { return; }
-    let side: i32 = distance * 2 + 1;
+fn stream_chunks(player: Connection, level: World, now: i64) -> void {
+    if (!player.streaming || player.waiting() >= 262144 || now < player.next_batch || now < player.next_missing) { return; }
     let sent: i32 = 0;
-    while (player.next_chunk < side * side && sent < 4 && player.waiting() < 262144) {
-        let index: i32 = player.next_chunk;
+    while (player.next_chunk < len(player.view_chunks) && sent < 4 && player.waiting() < 262144) {
+        let position: ChunkPosition = player.view_chunks[player.next_chunk];
         player.next_chunk++;
-        let dx: i32 = index % side - distance;
-        let dz: i32 = index / side - distance;
-        let chunk: Bytes = level.chunk(player.view_x + dx, player.view_z + dz);
-        if (chunk != null) {
-            if (sent == 0) { player.send(12, new Bytes()); }
-            player.send(44, chunk);
-            sent++;
+        if (player.has_sent(position.x, position.z)) { continue; }
+        let chunk: Bytes = level.chunk(position.x, position.z);
+        if (chunk == null) {
+            if (level.generating) {
+                level.request_chunk(position.x, position.z);
+                player.missing_chunks = true;
+            }
+            continue;
         }
+        if (sent == 0) { player.send(12, new Bytes()); }
+        player.send(44, chunk);
+        array_append(player.sent_chunks, position);
+        sent++;
     }
     if (sent > 0) {
         let batch: Bytes = new Bytes();
@@ -214,7 +229,14 @@ fn stream_chunks(player: Connection, level: World, distance: i32, now: i64) -> v
         player.send(11, batch);
         player.next_batch = now + 250;
     }
-    player.streaming = player.next_chunk < side * side;
+    if (player.next_chunk == len(player.view_chunks)) {
+        player.streaming = player.missing_chunks;
+        if (player.streaming) {
+            player.next_chunk = 0;
+            player.next_missing = now + 200;
+            player.missing_chunks = false;
+        }
+    }
 }
 
 fn update_block(player: Connection, x: i32, y: i32, z: i32, state: i32) -> void {
@@ -253,7 +275,7 @@ fn load_player(level: World, player: Connection) -> void {
     let x: f64 = reader.double(); let y: f64 = reader.double(); let z: f64 = reader.double();
     let yaw: i32 = reader.int32(); let pitch: i32 = reader.int32();
     let slot: i32 = reader.byte();
-    if (!valid_location(x, y, z) || slot >= 9 || !level.has_chunk(block_floor(x) >> 4, block_floor(z) >> 4)) { return; }
+    if (!valid_location(x, y, z) || slot >= 9 || !level.has_chunk(floor_block(x) >> 4, floor_block(z) >> 4)) { return; }
     player.x = x; player.y = y; player.z = z;
     player.yaw_bits = yaw; player.pitch_bits = pitch; player.selected = slot;
     for (let index: i32 = 0; index < 46; index++) {

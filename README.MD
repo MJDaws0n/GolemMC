@@ -23,7 +23,30 @@ On first run GolemMC generates `server.properties` with a loopback listener on p
 ## World modes
 
 - **Native flat.** GolemMC generates vanilla's default Overworld flat layers from bedrock through grass. The integration suite compares 98,304 block positions, biomes, heightmaps and lighting against a chunk from Mojang's server.
+- **Vanilla Overworld.** Set `vanilla-worldgen` and a numeric `level-seed`. Mojang's Docker-hosted 1.21.11 server generates new chunks as players explore. GolemMC serves clients, runs gameplay, and saves edits separately from the base terrain.
 - **Vanilla snapshot.** Supply `vanilla-snapshot` and the matching numeric `level-seed` to serve captured Overworld chunks without Java at runtime. An unedited chunk is sent byte for byte, preserving vanilla's blocks, biomes, structures, heightmaps, block entity data and light. Players stay inside the captured area. This mode does not generate new vanilla terrain.
+
+### Generate a real Overworld
+
+Install Node.js and start Docker. Choose a seed and generation directory. The first command installs the pinned worker dependencies. The worker uses the official 1.21.11 server JAR and verifies its checksum. Passing `--accept-eula` accepts the [Minecraft EULA](https://www.minecraft.net/eula) for the Docker server. You can append an absolute path to an existing official 1.21.11 `server.jar` to skip the download.
+
+```sh
+npm ci --prefix tools
+node tools/vanilla-worldgen.cjs run/generated-overworld 5241482691752223138 --accept-eula
+```
+
+Once the worker says it is ready, add these settings to a new properties file. Use a new save directory if you already played a flat world.
+
+```properties
+level-name=run/adventure-world
+level-seed=5241482691752223138
+vanilla-worldgen=run/generated-overworld
+view-distance=3
+```
+
+Run `./build/darwin_arm64/GolemMC path/to/server.properties` in another terminal. Connect to GolemMC at `127.0.0.1:25565` using a Minecraft Java 1.21.11 client. The vanilla worker has a separate, dynamically assigned loopback port. Keep the worker running for uncached terrain. Its chunk cache and GolemMC's edits both survive restart, and cached areas can be served without the worker. If the player reaches an uncached chunk, GolemMC holds them at their last valid position until the chunk is ready.
+
+### Capture a standalone snapshot
 
 To capture a snapshot, run a private headless vanilla **1.21.11** server with a fresh world, the desired numeric `level-seed`, `online-mode=false`, `enforce-secure-profile=false` and `view-distance` at least one greater than the radius being captured. Use Docker if the host lacks Java 21. The capture tool checks the seed against the server's reported hash.
 
@@ -48,7 +71,9 @@ GolemMC stores overlays and player saves separately. The legacy `region/blocks.d
 
 Server-list status, offline login, vanilla configuration registries, concurrent players, movement and presence updates, chat, view-based chunk streaming, day/night, creative block inventory and edits, basic timed survival mining, drop pickup and item consumption on placement, manual 2×2 inventory crafting, and persisted block edits, player location and inventory.
 
-The survival implementation is partial. Native seeded Overworld terrain, Nether and End travel, authentic account login, compression, mobs, combat, collisions and survival damage, crafting tables and recipe-book interactions, smelting, other container interactions, weather, vanilla item and block rules, and relighting after edits still need implementation. Edited chunks preserve the original lighting and heightmaps. Redstone and the full command set are outside this rewrite's current scope.
+Placement uses block-state collision boxes for standing and crouching players. Directional blocks use their clicked face, the player's look direction and hit height where applicable. GolemMC also updates live sky and block light around edits and recomputes edited heightmaps when streaming chunks. Relighting uses block opacity and emission. It approximates vanilla's occlusion for partial shapes such as stairs and slabs.
+
+The survival implementation is partial. Native seeded terrain, Nether and End travel, authentic account login, compression, mobs, combat, movement collision and survival damage, crafting tables and recipe-book interactions, smelting, other container interactions, weather, and specialised block behaviours still need implementation. Redstone and the full command set are outside this rewrite's current scope.
 
 ## Verification
 
@@ -61,6 +86,6 @@ npm ci --prefix tools
 npm test --prefix tools
 ```
 
-The integration suite uses headless protocol clients. Set `GOLEM_SNAPSHOT` to a vanilla Overworld capture to compare immutable chunk payloads byte for byte. Set `GOLEM_FLAT_SNAPSHOT` to a flat vanilla capture containing chunk `0.0` to compare decoded blocks, biomes and lighting against GolemMC's native flat generator.
+The integration suite uses headless protocol clients. Set `GOLEM_SNAPSHOT` to a vanilla Overworld capture to compare immutable chunk payloads byte for byte. Set `GOLEM_FLAT_SNAPSHOT` to a flat vanilla capture containing chunk `0.0` to compare decoded blocks, biomes and lighting against GolemMC's native flat generator. Set `GOLEM_GENERATOR` to a live generation directory to test an uncached location, with optional `GOLEM_WORLDGEN_X` and `GOLEM_WORLDGEN_Z` chunk coordinates.
 
 `data/configuration-774.bin` contains the vanilla 1.21.11 registry, tags and feature-flag frames obtained during configuration. The other protocol data files are generated by `node tools/registry-data.cjs` using the pinned [PrismarineJS Minecraft data](https://github.com/PrismarineJS/minecraft-data) package. The pinned reference client and decoder are dev dependencies.

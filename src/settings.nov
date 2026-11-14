@@ -15,6 +15,7 @@ class Settings {
     pub let seed: i64 = 0;
     pub let world: str = "world";
     pub let source: str = "";
+    pub let generator: str = "";
     pub let error: str = "";
 
     pub init(path: str) {
@@ -22,7 +23,7 @@ class Settings {
             self.error = write_all_text(path,
                 "server-ip=127.0.0.1\nserver-port=25565\nmotd=GolemMC\nmax-players=20\n" +
                 "view-distance=3\ngamemode=creative\ndifficulty=easy\nlevel-seed=0\n" +
-                "level-name=world\nvanilla-snapshot=\nonline-mode=false\n");
+                "level-name=world\nvanilla-snapshot=\nvanilla-worldgen=\nonline-mode=false\n");
             return;
         }
         let file: FileTextResult = read_all_text(path);
@@ -38,6 +39,7 @@ class Settings {
         if (self.port < 1 || self.port > 65535) { self.error = "server-port must be 1–65535"; }
         if (self.view < 2 || self.view > 8) { self.error = "view-distance must be 2–8"; }
         if (self.max_players < 1 || self.max_players > 64) { self.error = "max-players must be 1–64"; }
+        if (self.source != "" && self.generator != "") { self.error = "Choose one of vanilla-worldgen and vanilla-snapshot"; }
         if (self.world == "") { self.error = "level-name must not be empty"; }
         if (len(self.motd) > 2048) { self.error = "motd must be at most 2048 bytes"; }
     }
@@ -57,6 +59,7 @@ class Settings {
             }
         }
         if (key == "vanilla-snapshot") { self.source = value; }
+        if (key == "vanilla-worldgen") { self.generator = value; }
         if (key == "online-mode" && value != "false") { self.error = "online-mode requires Mojang authentication and is unavailable"; }
         if (key == "gamemode") {
             if (value == "creative") { self.mode = 1; }

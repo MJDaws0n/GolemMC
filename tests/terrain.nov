@@ -69,6 +69,6 @@ fn main() -> i32 {
         checked++;
     }
     print("Matched Minecraft at the noise, surface, carver and biome stages in " + to_str(checked) + " chunks");
-    if (checked < 15) { return 1; }
+    if (checked != 25) { return 1; }
     return 0;
 }

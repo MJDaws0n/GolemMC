@@ -122,12 +122,16 @@ class Overworld {
                 chunk.set_height(x, z, highest);
             }
         }
-        let index: i32 = 0;
-        for (let y: i32 = -16; y < 80; y++) {
-            for (let z: i32 = 0; z < 4; z++) {
-                for (let x: i32 = 0; x < 4; x++) {
-                    chunk.set_biome(index, self.biomes.quart(cx * 4 + x, y, cz * 4 + z));
-                    index++;
+        // Match the section traversal order used by the climate tree's
+        // last-result tie-break. Store samples in protocol Y/Z/X order.
+        self.biomes.begin_chunk();
+        for (let section_y: i32 = -16; section_y < 80; section_y += 4) {
+            for (let x: i32 = 0; x < 4; x++) {
+                for (let y: i32 = section_y; y < section_y + 4; y++) {
+                    for (let z: i32 = 0; z < 4; z++) {
+                        let index: i32 = ((y + 16) * 4 + z) * 4 + x;
+                        chunk.set_biome(index, self.biomes.quart(cx * 4 + x, y, cz * 4 + z));
+                    }
                 }
             }
         }

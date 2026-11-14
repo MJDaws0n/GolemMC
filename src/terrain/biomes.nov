@@ -48,6 +48,8 @@ class BiomeSampler {
         return sum;
     }
 
+    pub fn begin_chunk() -> void { self.nearest = -1; }
+
     pub fn quart(x: i32, y: i32, z: i32) -> i32 {
         for (let axis: i32 = 0; axis < 6; axis++) {
             let value: f64 = self.graph.sample(self.graph.roots[axis + 1], x * 4, y * 4, z * 4);

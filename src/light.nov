@@ -2,6 +2,7 @@ module light;
 
 import ../lib/std;
 import wire;
+import terrain/chunk;
 
 // A 3x3 chunk volume provides a 16-block border for propagation into the
 // middle chunk. No light step can travel more than 14 blocks from a source.
@@ -51,6 +52,12 @@ class LightVolume {
     pub fn load_section(cx: i32, cz: i32, section: i32, states: []i32) -> void {
         for (let index: i32 = 0; index < 4096; index++) {
             self.set(cx * 16 + (index & 15), section * 16 + (index >> 8), cz * 16 + ((index >> 4) & 15), states[index]);
+        }
+    }
+
+    pub fn load_terrain(cx: i32, cz: i32, chunk: TerrainChunk) -> void {
+        for (let index: i32 = 0; index < 98304; index++) {
+            self.set(cx * 16 + (index & 15), index >> 8, cz * 16 + ((index >> 4) & 15), chunk.state(index));
         }
     }
 

@@ -1,0 +1,115 @@
+module terrain_biomes;
+
+import ../../lib/std;
+import ../wire;
+import density;
+import noise;
+
+// The climate tree is stored in traversal order. Each node carries its
+// exclusive subtree end, biome ID (-1 for branches), and seven intervals.
+class BiomeSampler {
+    pub let ready: bool = false;
+    let tree: str;
+    let graph: DensityGraph;
+    let values: str = alloc_string(28);
+    let nearest: i32 = -1;
+    let best: i64;
+    let zoom_seed: i64;
+
+    pub init(graph: DensityGraph, zoom_seed: i64) {
+        self.graph = graph;
+        self.zoom_seed = zoom_seed;
+        let data: Bytes = read_blob("data/overworld-biomes-774.bin", 524288);
+        if (data == null || data.size < 36 || (data.size - 4) % 32 != 0 ||
+            substr_len(data.data, 0, 4) != "GB01") { return; }
+        self.tree = data.data;
+        self.ready = self.short_at(4) == (data.size - 4) / 32;
+        store32(ptr(self.values) + 24, 0);
+    }
+
+    fn short_at(offset: i32) -> i32 {
+        let address: u64 = ptr(self.tree) + to_u64(offset);
+        let value: i32 = (load8(address) << 8) | load8(address + 1);
+        if (value >= 32768) { return value - 65536; }
+        return value;
+    }
+
+    fn distance(offset: i32) -> i64 {
+        let sum: i64 = 0;
+        for (let axis: i32 = 0; axis < 7; axis++) {
+            let value: i32 = load32(ptr(self.values) + to_u64(axis * 4));
+            let low: i32 = self.short_at(offset + 4 + axis * 4);
+            let high: i32 = self.short_at(offset + 6 + axis * 4);
+            let delta: i64 = 0;
+            if (value < low) { delta = to_i64(low - value); }
+            else if (value > high) { delta = to_i64(value - high); }
+            sum += delta * delta;
+        }
+        return sum;
+    }
+
+    pub fn quart(x: i32, y: i32, z: i32) -> i32 {
+        for (let axis: i32 = 0; axis < 6; axis++) {
+            let value: f64 = self.graph.sample(self.graph.roots[axis + 1], x * 4, y * 4, z * 4);
+            let quantized: i32 = to_i32(binary32(binary32(value) * 10000.0));
+            store32(ptr(self.values) + to_u64(axis * 4), quantized);
+        }
+        self.best = 9223372036854775807;
+        if (self.nearest >= 0) { self.best = self.distance(self.nearest); }
+        let end: i32 = self.short_at(4);
+        let index: i32 = 1;
+        while (index < end && self.best != 0) {
+            let offset: i32 = 4 + index * 32;
+            let distance: i64 = self.distance(offset);
+            if (distance >= self.best) {
+                index = self.short_at(offset);
+            } else {
+                if (self.short_at(offset + 2) >= 0) {
+                    self.nearest = offset;
+                    self.best = distance;
+                }
+                index++;
+            }
+        }
+        return self.short_at(self.nearest + 2);
+    }
+
+    pub fn block(x: i32, y: i32, z: i32) -> i32 {
+        let qx: i32 = (x - 2) >> 2;
+        let qy: i32 = (y - 2) >> 2;
+        let qz: i32 = (z - 2) >> 2;
+        let fx: f64 = to_f64((x - 2) & 3) * 0.25;
+        let fy: f64 = to_f64((y - 2) & 3) * 0.25;
+        let fz: f64 = to_f64((z - 2) & 3) * 0.25;
+        let best: f64 = 100.0;
+        let chosen: i32 = 0;
+        for (let index: i32 = 0; index < 8; index++) {
+            let dx: i32 = index >> 2;
+            let dy: i32 = (index >> 1) & 1;
+            let dz: i32 = index & 1;
+            let mix: i64 = self.zoom_seed;
+            mix = biome_mix(mix, to_i64(qx + dx));
+            mix = biome_mix(mix, to_i64(qy + dy));
+            mix = biome_mix(mix, to_i64(qz + dz));
+            mix = biome_mix(mix, to_i64(qx + dx));
+            mix = biome_mix(mix, to_i64(qy + dy));
+            mix = biome_mix(mix, to_i64(qz + dz));
+            let px: f64 = fx - to_f64(dx) + biome_offset(mix);
+            mix = biome_mix(mix, self.zoom_seed);
+            let py: f64 = fy - to_f64(dy) + biome_offset(mix);
+            mix = biome_mix(mix, self.zoom_seed);
+            let pz: f64 = fz - to_f64(dz) + biome_offset(mix);
+            let distance: f64 = pz * pz + py * py + px * px;
+            if (distance < best) { best = distance; chosen = index; }
+        }
+        return self.quart(qx + (chosen >> 2), qy + ((chosen >> 1) & 1), qz + (chosen & 1));
+    }
+}
+
+fn biome_mix(seed: i64, value: i64) -> i64 {
+    return seed * (seed * 6364136223846793005 + 1442695040888963407) + value;
+}
+
+fn biome_offset(seed: i64) -> f64 {
+    return (to_f64(to_i32((seed >> 24) & 1023)) / 1024.0 - 0.5) * 0.9;
+}

@@ -1,0 +1,323 @@
+module terrain_surface;
+
+import ../../lib/std;
+import ../wire;
+import noise;
+import density;
+import aquifer;
+import biomes;
+import chunk;
+import legacy;
+
+class SurfaceRule {
+    pub let kind: i32;
+    pub let a: i32;
+    pub let b: i32;
+    pub let c: i32;
+    pub let d: i32;
+    pub let low: f64;
+    pub let high: f64;
+
+    pub init(reader: Reader) {
+        self.kind = reader.int32(); self.a = reader.int32(); self.b = reader.int32();
+        self.c = reader.int32(); self.d = reader.int32();
+        self.low = reader.double(); self.high = reader.double();
+    }
+}
+
+class Surface {
+    pub let ready: bool = false;
+    let graph: DensityGraph;
+    let aquifer: Aquifer;
+    let biomes: BiomeSampler;
+    let rules: []SurfaceRule = [];
+    let links: []i32 = [];
+    let root: i32;
+    let gradients: []TerrainRandom;
+    let temperatures: []f64 = [];
+    let temperature_noise: SimplexPlane = new SimplexPlane(new LegacyRandom(1234));
+    let biome_noise: SimplexPlane = new SimplexPlane(new LegacyRandom(2345));
+    let frozen_noise: []SimplexPlane;
+    let bands: []i32 = [];
+    let x: i32;
+    let y: i32;
+    let z: i32;
+    let above: i32;
+    let below: i32;
+    let depth: i32;
+    let minimum: i32;
+    let water: i32;
+    let biome: i32;
+    let steep: bool;
+    let secondary: f64;
+    let noise_cache: str = alloc_string(128 * 16);
+    let column: i32 = 0;
+
+    pub init(graph: DensityGraph, aquifer: Aquifer, biomes: BiomeSampler) {
+        self.graph = graph; self.aquifer = aquifer; self.biomes = biomes;
+        self.gradients = [graph.random.named("minecraft:bedrock_floor").fork(), graph.random.named("minecraft:deepslate").fork()];
+        memset(ptr(self.noise_cache), 0, 128 * 16);
+        self.build_bands();
+        let random: LegacyRandom = new LegacyRandom(3456);
+        self.frozen_noise = [new SimplexPlane(random), new SimplexPlane(random), new SimplexPlane(random)];
+        let reader: Reader = graph.surface_input;
+        self.root = reader.int32();
+        let rule_count: i32 = reader.int32();
+        let link_count: i32 = reader.int32();
+        if (rule_count < 1 || rule_count > 4096 || link_count < 0 || link_count > 4096 ||
+            self.root < 0 || self.root >= rule_count) { return; }
+        for (let index: i32 = 0; index < rule_count; index++) { array_append(self.rules, new SurfaceRule(reader)); }
+        for (let index: i32 = 0; index < link_count; index++) { array_append(self.links, reader.int32()); }
+        let temperature_count: i32 = reader.int32();
+        if (temperature_count < 1 || temperature_count > 128) { return; }
+        for (let index: i32 = 0; index < temperature_count; index++) { array_append(self.temperatures, reader.double()); }
+        self.ready = reader.valid && reader.left() == 0;
+    }
+
+    fn build_bands() -> void {
+        let random: TerrainRandom = self.graph.random.named("minecraft:clay_bands");
+        for (let index: i32 = 0; index < 192; index++) { array_append(self.bands, 12710); }
+        for (let index: i32 = 0; index < 192; index++) {
+            index += random.bounded(5) + 1;
+            if (index < 192) { self.bands[index] = 11243; }
+        }
+        self.make_bands(random, 1, 11246);
+        self.make_bands(random, 2, 11254);
+        self.make_bands(random, 1, 11256);
+        let count: i32 = random.bounded(7) + 9;
+        let index: i32 = 0;
+        for (let band: i32 = 0; band < count && index < 192; band++) {
+            self.bands[index] = 11242;
+            if (index > 1 && (random.next() & 1) != 0) { self.bands[index - 1] = 11250; }
+            if (index + 1 < 192 && (random.next() & 1) != 0) { self.bands[index + 1] = 11250; }
+            index += random.bounded(16) + 4;
+        }
+    }
+
+    fn make_bands(random: TerrainRandom, minimum: i32, state: i32) -> void {
+        let count: i32 = random.bounded(10) + 6;
+        for (let index: i32 = 0; index < count; index++) {
+            let size: i32 = minimum + random.bounded(3);
+            let start: i32 = random.bounded(192);
+            for (let offset: i32 = 0; offset < size && start + offset < 192; offset++) {
+                self.bands[start + offset] = state;
+            }
+        }
+    }
+
+    fn column_noise(id: i32) -> f64 {
+        let entry: u64 = ptr(self.noise_cache) + to_u64(id * 16);
+        if (load32(entry) == self.column) { return f64_from_bits(load64(entry + 8)); }
+        let value: f64 = self.graph.noises[id].sample(to_f64(self.x), 0.0, to_f64(self.z));
+        store32(entry, self.column); store64(entry + 8, to_u64(f64_bits(value)));
+        return value;
+    }
+
+    fn blended_surface(x: i32, z: i32) -> i32 {
+        let corner_x: i32 = (x >> 4) << 4;
+        let corner_z: i32 = (z >> 4) << 4;
+        let tx: f64 = to_f64(x & 15) / 16.0;
+        let tz: f64 = to_f64(z & 15) / 16.0;
+        let a: f64 = terrain_lerp(tx, to_f64(self.aquifer.preliminary(corner_x, corner_z)),
+            to_f64(self.aquifer.preliminary(corner_x + 16, corner_z)));
+        let b: f64 = terrain_lerp(tx, to_f64(self.aquifer.preliminary(corner_x, corner_z + 16)),
+            to_f64(self.aquifer.preliminary(corner_x + 16, corner_z + 16)));
+        return to_i32(terrain_floor(terrain_lerp(tz, a, b))) + self.depth - 8;
+    }
+
+    fn condition(id: i32) -> bool {
+        let rule: SurfaceRule = self.rules[id];
+        if (rule.kind == 4) { return self.y >= self.minimum; }
+        if (rule.kind == 5) {
+            let depth: i32 = self.above;
+            if (rule.d != 0) { depth = self.below; }
+            let limit: i32 = 1 + rule.a + rule.b * self.depth;
+            if (rule.c != 0) { limit += to_i32((self.secondary + 1.0) * 0.5 * to_f64(rule.c)); }
+            return depth <= limit;
+        }
+        if (rule.kind == 6) {
+            if (self.biome < 0) { self.biome = self.biomes.block(self.x, self.y, self.z); }
+            for (let index: i32 = rule.a; index < rule.a + rule.b; index++) {
+                if (self.biome == self.links[index]) { return true; }
+            }
+            return false;
+        }
+        if (rule.kind == 7) { return self.y + rule.c * self.above >= rule.a + self.depth * rule.b; }
+        if (rule.kind == 8) {
+            let value: f64 = self.column_noise(rule.a);
+            return value >= rule.low && value <= rule.high;
+        }
+        if (rule.kind == 9) {
+            return self.water == -2147483648 || self.y + rule.c * self.above >= self.water + rule.a + self.depth * rule.b;
+        }
+        if (rule.kind == 10) { return !self.condition(rule.a); }
+        if (rule.kind == 11) { return self.depth <= 0; }
+        if (rule.kind == 12) {
+            if (self.biome < 0) { self.biome = self.biomes.block(self.x, self.y, self.z); }
+            return self.temperature(self.biome, self.y) < 0.15000000596046448;
+        }
+        if (rule.kind == 13) { return self.steep; }
+        if (rule.kind == 14) {
+            if (self.y <= rule.a) { return true; }
+            if (self.y >= rule.b) { return false; }
+            let probability: f64 = 1.0 - to_f64(self.y - rule.a) / to_f64(rule.b - rule.a);
+            let random: TerrainRandom = self.gradients[rule.c].at(self.x, self.y, self.z);
+            return random.fraction() < probability;
+        }
+        return false;
+    }
+
+    fn material(id: i32) -> i32 {
+        let rule: SurfaceRule = self.rules[id];
+        if (rule.kind == 2) { return rule.a; }
+        if (rule.kind == 3) {
+            let offset: i32 = to_i32(terrain_floor(self.column_noise(self.graph.roots[23]) * 4.0 + 0.5));
+            return self.bands[(self.y + offset + 192) % 192];
+        }
+        if (rule.kind == 1) {
+            if (self.condition(rule.a)) { return self.material(rule.b); }
+            return -1;
+        }
+        for (let index: i32 = rule.a; index < rule.a + rule.b; index++) {
+            let state: i32 = self.material(self.links[index]);
+            if (state >= 0) { return state; }
+        }
+        return -1;
+    }
+
+    fn temperature(biome: i32, y: i32) -> f64 {
+        let value: f64 = self.temperatures[biome];
+        let x: f64 = to_f64(self.x);
+        let z: f64 = to_f64(self.z);
+        if (biome == 11 || biome == 22) {
+            let frozen: f64 = self.frozen_noise[0].sample(x * 0.05, z * 0.05) / 7.0 +
+                self.frozen_noise[1].sample(x * 0.025, z * 0.025) * (2.0 / 7.0) +
+                self.frozen_noise[2].sample(x * 0.0125, z * 0.0125) * (4.0 / 7.0);
+            if (frozen * 7.0 + self.biome_noise.sample(x * 0.2, z * 0.2) < 0.3 &&
+                self.biome_noise.sample(x * 0.09, z * 0.09) < 0.8) { value = 0.20000000298023224; }
+        }
+        if (y <= 80) { return value; }
+        let variation: f64 = binary32(self.temperature_noise.sample(binary32(x / 8.0), binary32(z / 8.0)) * 8.0);
+        return binary32(value - binary32(binary32(binary32(variation + to_f64(y) - 80.0) * 0.05000000074505806) / 40.0));
+    }
+
+    fn eroded_badlands(chunk: TerrainChunk, x: i32, z: i32, top: i32) -> void {
+        let wx: f64 = to_f64(self.x); let wz: f64 = to_f64(self.z);
+        let height: f64 = terrain_abs(self.column_noise(self.graph.roots[19]) * 8.25);
+        let pillar: f64 = self.graph.noises[self.graph.roots[17]].sample(wx * 0.2, 0.0, wz * 0.2) * 15.0;
+        if (pillar < height) { height = pillar; }
+        if (height <= 0.0) { return; }
+        let roof: f64 = terrain_abs(self.graph.noises[self.graph.roots[18]].sample(wx * 0.75, 0.0, wz * 0.75) * 1.5);
+        let limit: f64 = -i64_to_f64(terrain_floor(-roof * 50.0)) + 24.0;
+        let rise: f64 = height * height * 2.5;
+        if (limit < rise) { rise = limit; }
+        let summit: i32 = to_i32(terrain_floor(64.0 + rise));
+        if (top > summit) { return; }
+        for (let y: i32 = summit; y >= -64; y--) {
+            let state: i32 = chunk.block(x, y, z);
+            if (state == 1) { break; }
+            if (state == 86) { return; }
+        }
+        for (let y: i32 = summit; y >= -64 && chunk.block(x, y, z) == 0; y--) { chunk.set(x, y, z, 1); }
+        if (summit > chunk.height(x, z)) { chunk.set_height(x, z, summit); }
+    }
+
+    fn iceberg(chunk: TerrainChunk, x: i32, z: i32, top: i32, biome: i32) -> void {
+        let wx: f64 = to_f64(self.x); let wz: f64 = to_f64(self.z);
+        let height: f64 = terrain_abs(self.column_noise(self.graph.roots[22]) * 8.25);
+        let pillar: f64 = self.graph.noises[self.graph.roots[20]].sample(wx * 1.28, 0.0, wz * 1.28) * 15.0;
+        if (pillar < height) { height = pillar; }
+        if (height <= 1.8) { return; }
+        let roof: f64 = terrain_abs(self.graph.noises[self.graph.roots[21]].sample(wx * 1.17, 0.0, wz * 1.17) * 1.5);
+        let limit: f64 = -i64_to_f64(terrain_floor(-roof * 40.0)) + 14.0;
+        let size: f64 = height * height * 1.2;
+        if (limit < size) { size = limit; }
+        if (self.temperature(biome, 63) > 0.10000000149011612) { size -= 2.0; }
+        let bottom: f64 = 0.0; let summit: f64 = 0.0;
+        if (size > 2.0) { bottom = 56.0 - size; summit = 63.0 + size; }
+        let random: TerrainRandom = self.graph.random.at(self.x, 0, self.z);
+        let snow_limit: i32 = 2 + random.bounded(4);
+        let snow_base: i32 = 81 + random.bounded(10);
+        let snow: i32 = 0;
+        if (to_i32(summit) + 1 > top) { top = to_i32(summit) + 1; }
+        for (let y: i32 = top; y >= self.minimum && y >= -64; y--) {
+            let state: i32 = chunk.block(x, y, z);
+            let grow: bool = state == 0 && y < to_i32(summit) && random.uniform() > 0.01;
+            if (!grow) {
+                grow = state == 86 && y > to_i32(bottom) && y < 63 && bottom != 0.0 && random.uniform() > 0.15;
+            }
+            if (!grow) { continue; }
+            let ice: i32 = 12712;
+            if (snow <= snow_limit && y > snow_base) { ice = 6727; snow++; }
+            chunk.set(x, y, z, ice);
+            if (y > chunk.height(x, z)) { chunk.set_height(x, z, y); }
+        }
+    }
+
+    pub fn repair_floor(chunk: TerrainChunk, x: i32, y: i32, z: i32, fluid: bool) -> void {
+        self.column++;
+        self.x = chunk.x * 16 + x; self.y = y; self.z = chunk.z * 16 + z;
+        self.depth = to_i32(self.column_noise(self.graph.roots[15]) * 2.75 + 3.0 +
+            self.graph.random.at(self.x, 0, self.z).uniform() * 0.25);
+        self.minimum = self.blended_surface(self.x, self.z);
+        self.secondary = self.column_noise(self.graph.roots[16]);
+        self.above = 1; self.below = 1; self.biome = -1;
+        self.water = -2147483648;
+        if (fluid) { self.water = y + 1; }
+        self.steep = self.slope(chunk, x, z);
+        let state: i32 = self.material(self.root);
+        if (state >= 0) { chunk.set(x, y, z, state); }
+    }
+
+    fn slope(chunk: TerrainChunk, x: i32, z: i32) -> bool {
+        let north: i32 = z - 1; let south: i32 = z + 1;
+        let west: i32 = x - 1; let east: i32 = x + 1;
+        if (north < 0) { north = 0; } if (south > 15) { south = 15; }
+        if (west < 0) { west = 0; } if (east > 15) { east = 15; }
+        return chunk.height(x, south) >= chunk.height(x, north) + 4 ||
+            chunk.height(west, z) >= chunk.height(east, z) + 4;
+    }
+
+    pub fn apply(chunk: TerrainChunk) -> void {
+        for (let x: i32 = 0; x < 16; x++) {
+            for (let z: i32 = 0; z < 16; z++) {
+                self.column++;
+                self.x = chunk.x * 16 + x;
+                self.z = chunk.z * 16 + z;
+                self.depth = to_i32(self.column_noise(self.graph.roots[15]) * 2.75 + 3.0 +
+                    self.graph.random.at(self.x, 0, self.z).uniform() * 0.25);
+                self.minimum = self.blended_surface(self.x, self.z);
+                self.secondary = self.column_noise(self.graph.roots[16]);
+                let top: i32 = chunk.height(x, z) + 1;
+                let biome: i32 = self.biomes.block(self.x, top, self.z);
+                if (biome == 19) { self.eroded_badlands(chunk, x, z, top); }
+                self.steep = self.slope(chunk, x, z);
+                self.above = 0; self.water = -2147483648;
+                let floor: i32 = 320;
+                for (let y: i32 = chunk.height(x, z); y >= -64; y--) {
+                    let state: i32 = chunk.block(x, y, z);
+                    if (state == 0) { self.above = 0; self.water = -2147483648; continue; }
+                    if (state == 86 || state == 102) {
+                        if (self.water == -2147483648) { self.water = y + 1; }
+                        continue;
+                    }
+                    if (floor >= y) {
+                        floor = -64;
+                        for (let lower: i32 = y - 1; lower >= -64; lower--) {
+                            let below: i32 = chunk.block(x, lower, z);
+                            if (below == 0 || below == 86 || below == 102) { floor = lower + 1; break; }
+                        }
+                    }
+                    self.above++;
+                    if (state != 1) { continue; }
+                    self.below = y - floor + 1;
+                    self.y = y;
+                    self.biome = -1;
+                    let material: i32 = self.material(self.root);
+                    if (material >= 0) { chunk.set(x, y, z, material); }
+                }
+                if (biome == 11 || biome == 22) { self.iceberg(chunk, x, z, top, biome); }
+            }
+        }
+    }
+}

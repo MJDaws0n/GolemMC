@@ -3,6 +3,17 @@ const path = require('node:path')
 const data = require('minecraft-data')('1.21.11')
 const writePlacementData = require('./placement-data.cjs')
 
+function writeCarvers (directory, jarData) {
+  const tags = fs.readFileSync(jarData, 'utf8').split(/\r?\n/).filter(Boolean)
+  const replaceable = Buffer.alloc(Math.max(...data.blocksArray.map(block => block.maxStateId)) + 1)
+  for (const name of tags) {
+    const block = data.blocksByName[name.replace('minecraft:', '')]
+    if (!block) throw new Error('Unknown replaceable block ' + name)
+    replaceable.fill(1, block.minStateId, block.maxStateId + 1)
+  }
+  fs.writeFileSync(path.join(directory, 'overworld-carver-774.bin'), replaceable)
+}
+
 function writeRegistryData (directory) {
   const states = Buffer.alloc((Math.max(...data.itemsArray.map(item => item.id)) + 1) * 4, 255)
   for (const item of data.itemsArray) {
@@ -78,5 +89,8 @@ function writeRegistryData (directory) {
   fs.writeFileSync(path.join(directory, 'item-limits-774.bin'), limits)
 }
 
-if (require.main === module) writeRegistryData(process.argv[2] || 'data')
+if (require.main === module) {
+  writeRegistryData(process.argv[2] || 'data')
+  if (process.argv[3]) writeCarvers(process.argv[2] || 'data', process.argv[3])
+}
 module.exports = writeRegistryData

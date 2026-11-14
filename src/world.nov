@@ -7,6 +7,8 @@ import ../lib/darwin;
 import wire;
 import identity;
 import light;
+import terrain/overworld;
+import terrain/chunk;
 
 fn air_block(state: i32) -> bool { return state == 0 || state == 15090 || state == 15091; }
 
@@ -45,6 +47,7 @@ class World {
     let folder: str;
     let lock: i32 = -1;
     let source: str;
+    let terrain: Overworld = null;
     let changes: []BlockChange = [];
     let dirty: bool = false;
     let item_states: Bytes;
@@ -55,12 +58,12 @@ class World {
     let light_cursor: i32 = 0;
     let materials: Bytes;
 
-    pub init(folder: str, source: str, seed: i64) {
+    pub init(folder: str, source: str, seed: i64, level_type: str) {
         self.folder = folder;
         self.source = source;
         self.seed = seed;
         self.seed_hash = hash_seed(seed);
-        self.flat = source == "";
+
         self.item_states = read_blob("data/item-block-states-774.bin", 16384);
         self.item_limits = read_blob("data/item-limits-774.bin", 4096);
         self.block_rules = read_blob("data/block-rules-774.bin", 262144);
@@ -71,7 +74,7 @@ class World {
             self.item_states.size != self.item_limits.size * 4 || self.block_rules.size % 8 != 0) {
             self.error = "Cannot load protocol 774 block and item registries"; return;
         }
-        if (!self.flat) {
+        if (source != "") {
             let meta: FileTextResult = read_all_text(source + "/snapshot.txt");
             let fields: []str = string_split(str_trim(meta.data), " ");
             if (meta.error != "" || len(fields) != 5 || fields[0] != "774" || fields[1] != format_i64(seed)) {
@@ -94,19 +97,88 @@ class World {
             return;
         }
         let rules_path: str = folder + "/golem-world.txt";
-        let rules: str = "774 " + format_i64(seed) + " " + source + "\n";
-        if (file_exists(rules_path)) {
-            let existing: FileTextResult = read_all_text(rules_path);
-            if (existing.error != "" || existing.data != rules) { self.error = "The world directory belongs to a different seed or snapshot"; return; }
-        } else {
-            if (file_exists(folder + "/region/blocks.dat")) {
-                self.error = "This directory contains a legacy GolemMC world. Set level-name to a new directory.";
-                return;
-            }
+        let prefix: str = "774 " + format_i64(seed) + " ";
+        let exists: bool = file_exists(rules_path);
+        let existing: str = "";
+        if (exists) {
+            let metadata: FileTextResult = read_all_text(rules_path);
+            if (metadata.error != "") { self.error = metadata.error; return; }
+            existing = metadata.data;
+        }
+        self.flat = source == "" && (level_type == "minecraft:flat" ||
+            (level_type == "" && existing == prefix + "\n"));
+        let rules: str = prefix + source + "\n";
+        if (source == "" && !self.flat) {
+            rules = prefix + "native-overworld-v1\n";
+        }
+        if (exists && existing != rules) {
+            self.error = "The world directory belongs to a different seed or world type. Set level-name to a new directory.";
+            return;
+        }
+        if (!exists && file_exists(folder + "/region/blocks.dat")) {
+            self.error = "This directory contains a legacy GolemMC world. Set level-name to a new directory.";
+            return;
+        }
+        if (source == "" && !self.flat) {
+            self.terrain = new Overworld(seed, self.seed_hash);
+            if (!self.terrain.ready) { self.error = "Cannot load protocol 774 Overworld generation data"; return; }
+            self.select_spawn();
+        }
+        if (!exists) {
             self.error = write_all_text(rules_path, rules);
             if (self.error != "") { return; }
         }
         self.load();
+    }
+
+    fn select_spawn() -> void {
+        let probe: []i32 = self.terrain.spawn_probe();
+        let cx: i32 = probe[0] >> 4; let cz: i32 = probe[1] >> 4;
+        let home: TerrainChunk = self.terrain.chunk(cx, cz);
+        self.spawn_x = cx * 16 + 8;
+        self.spawn_z = cz * 16 + 8;
+        self.spawn_y = home.height(8, 8) + 1;
+        if (self.spawn_y < -63) { self.spawn_y = 64; }
+        let best: i32 = 2147483647;
+        for (let ring: i32 = 0; ring <= 2; ring++) {
+            for (let dz: i32 = -ring; dz <= ring; dz++) {
+                for (let dx: i32 = -ring; dx <= ring; dx++) {
+                    if (dx != -ring && dx != ring && dz != -ring && dz != ring) { continue; }
+                    let chunk: TerrainChunk = self.terrain.chunk(cx + dx, cz + dz);
+                    for (let z: i32 = 0; z < 16; z++) {
+                        for (let x: i32 = 0; x < 16; x++) {
+                            let world_x: i32 = chunk.x * 16 + x;
+                            let world_z: i32 = chunk.z * 16 + z;
+                            let vx: i32 = world_x - probe[0]; let vz: i32 = world_z - probe[1];
+                            let distance: i32 = vx * vx + vz * vz;
+                            if (distance >= best) { continue; }
+                            let y: i32 = chunk.height(x, z);
+                            if (y < -64 || y > 317) { continue; }
+                            let state: i32 = chunk.block(x, y, z);
+                            if (air_block(state) || state == 86 || state == 102 || state == 24487) { continue; }
+                            best = distance;
+                            self.spawn_x = world_x; self.spawn_y = y + 1; self.spawn_z = world_z;
+                        }
+                    }
+                }
+            }
+            if (best != 2147483647) { return; }
+        }
+    }
+
+    // Spread cold terrain generation across polling ticks. The following
+    // chunk requires its one-chunk lighting border before it can be sent.
+    pub fn prepare_chunk(x: i32, z: i32) -> bool {
+        if (self.terrain == null) { return true; }
+        for (let dz: i32 = -1; dz <= 1; dz++) {
+            for (let dx: i32 = -1; dx <= 1; dx++) {
+                if (!self.terrain.cached(x + dx, z + dz)) {
+                    self.terrain.chunk(x + dx, z + dz);
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     pub fn release() -> void { file_close(self.lock); }
@@ -129,7 +201,7 @@ class World {
     }
 
     pub fn has_chunk(x: i32, z: i32) -> bool {
-        return self.flat || file_exists(chunk_path(self.source, x, z));
+        return self.source == "" || file_exists(chunk_path(self.source, x, z));
     }
 
     pub fn player_path(username: str) -> str { return self.folder + "/players/" + username + ".bin"; }
@@ -156,6 +228,7 @@ class World {
             if (y == -61) { return 9; }
             return 0;
         }
+        if (self.terrain != null) { return self.terrain.chunk(x >> 4, z >> 4).block(x, y, z); }
         let source: Bytes = read_blob(chunk_path(self.source, x >> 4, z >> 4), 2097151);
         if (source == null) { return -1; }
         return read_block(source, x, y, z);
@@ -244,6 +317,9 @@ class World {
             for (let dx: i32 = 0; dx < 3; dx++) {
                 if (self.flat) {
                     volume.fill_flat(dx, dz);
+                } else if (self.terrain != null) {
+                    let chunk: TerrainChunk = self.terrain.chunk(x + dx - 1, z + dz - 1);
+                    volume.load_terrain(dx, dz, chunk);
                 } else {
                     let source: Bytes = read_blob(chunk_path(self.source, x + dx - 1, z + dz - 1), 2097151);
                     if (source != null && !load_light_blocks(volume, source, dx, dz)) { return null; }
@@ -269,7 +345,10 @@ class World {
     pub fn chunk(x: i32, z: i32) -> Bytes {
         let original: Bytes = null;
         if (self.flat) { original = flat_chunk(x, z); }
-        else { original = read_blob(chunk_path(self.source, x, z), 2097151); }
+        else if (self.terrain != null) {
+            let generated: TerrainChunk = self.terrain.chunk(x, z);
+            original = terrain_packet(generated, self.lighting(x, z), self.materials.data);
+        } else { original = read_blob(chunk_path(self.source, x, z), 2097151); }
         if (original == null) { return null; }
         let edits: []BlockChange = [];
         let relight: bool = false;
@@ -281,7 +360,7 @@ class World {
         }
         if (!relight && len(edits) == 0) { return original; }
         let lighting: Bytes = null;
-        if (relight) {
+        if (relight && self.terrain == null) {
             lighting = self.lighting(x, z);
             if (lighting == null) { return null; }
         }
@@ -342,6 +421,70 @@ fn flat_chunk(x: i32, z: i32) -> Bytes {
     result.varint(2048); result.append(sky, 0, 2048);
     result.varint(0);
     return result;
+}
+
+fn terrain_packet(chunk: TerrainChunk, lighting: Bytes, materials: str) -> Bytes {
+    let sections: Bytes = new Bytes(32768);
+    let maps: Heightmaps = new Heightmaps();
+    for (let section: i32 = 0; section < 24; section++) {
+        let states: []i32 = [];
+        let biomes: []i32 = [];
+        let non_air: i32 = 0;
+        for (let index: i32 = 0; index < 4096; index++) {
+            let state: i32 = chunk.state(section * 4096 + index);
+            array_append(states, state);
+            if (!air_block(state)) { non_air++; }
+        }
+        for (let index: i32 = 0; index < 64; index++) {
+            array_append(biomes, chunk.biome(section * 64 + index));
+        }
+        sections.short(non_air);
+        write_palette(sections, states, 4, 8, 15);
+        write_palette(sections, biomes, 1, 3, 7);
+        if (non_air > 0) { maps.add(section, states, materials); }
+    }
+    let result: Bytes = new Bytes(1024 + sections.size + lighting.size);
+    result.int32(chunk.x); result.int32(chunk.z);
+    maps.write(result);
+    result.varint(sections.size);
+    result.append(sections.data, 0, sections.size);
+    result.varint(0);
+    result.append(lighting.data, 0, lighting.size);
+    return result;
+}
+
+fn write_palette(packet: Bytes, states: []i32, minimum: i32, indirect_max: i32, direct: i32) -> void {
+    let palette: []i32 = [];
+    let indexes: []i32 = [];
+    let capacity: i32 = 1 << indirect_max;
+    for (let index: i32 = 0; index < len(states); index++) {
+        let state: i32 = states[index];
+        let found: i32 = 0;
+        while (found < len(palette) && palette[found] != state) { found++; }
+        if (found == len(palette)) { array_append(palette, state); }
+        if (found >= capacity) { break; }
+        array_append(indexes, found);
+    }
+    if (len(palette) == 1) { packet.byte(0); packet.varint(palette[0]); return; }
+    let bits: i32 = minimum;
+    if (len(palette) <= capacity) {
+        while ((1 << bits) < len(palette)) { bits++; }
+        packet.byte(bits);
+        packet.varint(len(palette));
+        for (let index: i32 = 0; index < len(palette); index++) { packet.varint(palette[index]); }
+    } else {
+        bits = direct;
+        packet.byte(bits);
+        indexes = states;
+    }
+    let per_word: i32 = 64 / bits;
+    for (let base: i32 = 0; base < len(indexes); base += per_word) {
+        let packed: i64 = 0;
+        for (let bit: i32 = 0; bit < per_word && base + bit < len(indexes); bit++) {
+            packed = packed | (to_i64(indexes[base + bit]) << to_i64(bit * bits));
+        }
+        packet.long(packed);
+    }
 }
 
 fn palette_count(bits: i32, entries: i32) -> i32 {

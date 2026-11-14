@@ -1,0 +1,84 @@
+module terrain_legacy;
+
+import ../../lib/std;
+import noise;
+
+// Terrain temperature and the separate cave-carving stage use the old
+// 48-bit random source. The density router uses Xoroshiro.
+class LegacyRandom {
+    let state: i64;
+    pub init(seed: i64) { self.reset(seed); }
+    pub fn reset(seed: i64) -> void { self.state = (seed ^ 25214903917) & 281474976710655; }
+
+    fn bits(width: i32) -> i32 {
+        self.state = (self.state * 25214903917 + 11) & 281474976710655;
+        return to_i32(self.state >> to_i64(48 - width));
+    }
+
+    pub fn bounded(bound: i32) -> i32 {
+        if ((bound & (bound - 1)) == 0) { return to_i32((to_i64(bound) * to_i64(self.bits(31))) >> 31); }
+        let value: i32 = self.bits(31);
+        let result: i32 = value % bound;
+        while (to_i32(to_i64(value) - to_i64(result) + to_i64(bound - 1)) < 0) {
+            value = self.bits(31); result = value % bound;
+        }
+        return result;
+    }
+
+    pub fn long() -> i64 {
+        let upper: i64 = to_i64(self.bits(32));
+        return (upper << 32) + to_i64(self.bits(32));
+    }
+
+    pub fn uniform() -> f64 {
+        let upper: i64 = to_i64(self.bits(26));
+        let lower: i64 = to_i64(self.bits(27));
+        return i64_to_f64((upper << 27) + lower) / 9007199254740992.0;
+    }
+
+    pub fn fraction() -> f64 { return to_f64(self.bits(24)) / 16777216.0; }
+}
+
+class SimplexPlane {
+    let permutation: str = alloc_string(256);
+
+    pub init(random: LegacyRandom) {
+        random.uniform(); random.uniform(); random.uniform();
+        let data: u64 = ptr(self.permutation);
+        for (let index: i32 = 0; index < 256; index++) { store8(data + to_u64(index), index); }
+        for (let index: i32 = 0; index < 256; index++) {
+            let other: i32 = index + random.bounded(256 - index);
+            let a: u64 = data + to_u64(index); let b: u64 = data + to_u64(other);
+            let swap: i32 = load8(a);
+            store8(a, load8(b)); store8(b, swap);
+        }
+    }
+
+    fn hash(x: i32, z: i32) -> i32 {
+        let data: u64 = ptr(self.permutation);
+        let p: i32 = load8(data + to_u64(z & 255));
+        return load8(data + to_u64((x + p) & 255)) % 12;
+    }
+
+    fn corner(x: f64, z: f64, hash: i32) -> f64 {
+        let distance: f64 = 0.5 - x * x - z * z;
+        if (distance < 0.0) { return 0.0; }
+        distance *= distance;
+        return distance * distance * terrain_dot(hash, x, z, 0.0);
+    }
+
+    pub fn sample(x: f64, z: f64) -> f64 {
+        let skew: f64 = (x + z) * 0.3660254037844386;
+        let gx: i32 = to_i32(terrain_floor(x + skew));
+        let gz: i32 = to_i32(terrain_floor(z + skew));
+        let unskew: f64 = to_f64(gx + gz) * 0.21132486540518713;
+        let dx: f64 = x - (to_f64(gx) - unskew);
+        let dz: f64 = z - (to_f64(gz) - unskew);
+        let sx: i32 = 0;
+        if (dx > dz) { sx = 1; }
+        let sz: i32 = 1 - sx;
+        return 70.0 * (self.corner(dx, dz, self.hash(gx, gz)) +
+            self.corner(dx - to_f64(sx) + 0.21132486540518713, dz - to_f64(sz) + 0.21132486540518713, self.hash(gx + sx, gz + sz)) +
+            self.corner(dx - 1.0 + 0.42264973081037427, dz - 1.0 + 0.42264973081037427, self.hash(gx + 1, gz + 1)));
+    }
+}

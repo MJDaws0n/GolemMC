@@ -142,6 +142,13 @@ class Reader {
         self.offset += amount;
     }
 
+    pub fn fixed_text(amount: i32) -> str {
+        if (!self.valid || amount < 0 || amount > self.left()) { self.valid = false; return ""; }
+        let result: str = copy_bytes(ptr(self.data) + to_u64(self.offset), amount);
+        self.offset += amount;
+        return result;
+    }
+
     pub fn string(maximum: i32) -> str {
         let amount: i32 = self.varint();
         if (!self.valid || amount < 0 || amount > maximum || amount > self.left()) {

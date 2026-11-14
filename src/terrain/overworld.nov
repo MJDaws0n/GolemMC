@@ -1,0 +1,164 @@
+module terrain_overworld;
+
+import ../../lib/std;
+import noise;
+import density;
+import biomes;
+import aquifer;
+import chunk;
+import surface;
+import carvers;
+
+class Overworld {
+    pub let ready: bool = false;
+    let graph: DensityGraph;
+    let biomes: BiomeSampler;
+    let aquifer: Aquifer;
+    let surface: Surface;
+    let carvers: Carvers;
+    let ore_random: TerrainRandom;
+    let chunks: []TerrainChunk = [];
+    let replace: i32 = 0;
+
+    pub init(seed: i64, biome_seed: i64) {
+        self.graph = new DensityGraph(seed);
+        if (!self.graph.ready) { return; }
+        self.biomes = new BiomeSampler(self.graph, biome_seed);
+        self.aquifer = new Aquifer(self.graph);
+        self.surface = new Surface(self.graph, self.aquifer, self.biomes);
+        self.carvers = new Carvers(seed, self.aquifer, self.surface);
+        self.ore_random = self.graph.random.named("minecraft:ore").fork();
+        self.ready = self.biomes.ready && self.surface.ready && self.carvers.ready;
+    }
+
+    pub fn cached(x: i32, z: i32) -> bool {
+        for (let index: i32 = 0; index < len(self.chunks); index++) {
+            if (self.chunks[index].x == x && self.chunks[index].z == z) { return true; }
+        }
+        return false;
+    }
+
+    pub fn spawn_probe() -> []i32 {
+        let best: i64 = self.spawn_fitness(0, 0);
+        let result: []i32 = [0, 0];
+        let spacing: i32 = 512;
+        let range: i32 = 2048;
+        for (let pass: i32 = 0; pass < 2; pass++) {
+            let x: i32 = result[0]; let z: i32 = result[1];
+            let angle: f64 = 0.0;
+            let radius: i32 = spacing;
+            while (radius <= range) {
+                let gx: i32 = x + to_i32(terrain_sine(angle) * to_f64(radius));
+                let gz: i32 = z + to_i32(terrain_sine(angle + 1.5707963267948966) * to_f64(radius));
+                let fitness: i64 = self.spawn_fitness(gx, gz);
+                if (fitness < best) { best = fitness; result[0] = gx; result[1] = gz; }
+                angle = binary32(angle + binary32(to_f64(spacing) / to_f64(radius)));
+                if (angle > 6.283185307179586) { angle = 0.0; radius += spacing; }
+            }
+            range = 512; spacing = 32;
+        }
+        return result;
+    }
+
+    fn spawn_fitness(x: i32, z: i32) -> i64 {
+        let distance: i64 = to_i64(x) * to_i64(x) + to_i64(z) * to_i64(z);
+        let penalty: i64 = 0;
+        for (let index: i32 = 1; index <= 6; index++) {
+            if (index == 5) { continue; }
+            let value: f64 = self.graph.sample(self.graph.roots[index], (x >> 2) * 4, 0, (z >> 2) * 4);
+            let climate: i32 = to_i32(binary32(binary32(value) * 10000.0));
+            let minimum: i32 = -10000;
+            if (index == 3) { minimum = -1100; }
+            if (index == 6) {
+                if (climate < 0) { climate = -climate; }
+                minimum = 1600;
+            }
+            let delta: i64 = 0;
+            if (climate < minimum) { delta = to_i64(minimum - climate); }
+            else if (climate > 10000) { delta = to_i64(climate - 10000); }
+            penalty += delta * delta;
+        }
+        return distance + penalty * 4194304;
+    }
+
+    pub fn chunk(x: i32, z: i32) -> TerrainChunk {
+        for (let index: i32 = 0; index < len(self.chunks); index++) {
+            let chunk: TerrainChunk = self.chunks[index];
+            if (chunk.x == x && chunk.z == z) { return chunk; }
+        }
+        let chunk: TerrainChunk = self.surface_chunk(x, z);
+        self.carvers.apply(chunk);
+        if (len(self.chunks) < 64) { array_append(self.chunks, chunk); }
+        else {
+            self.chunks[self.replace] = chunk;
+            self.replace = (self.replace + 1) % 64;
+        }
+        return chunk;
+    }
+
+    pub fn surface_chunk(x: i32, z: i32) -> TerrainChunk {
+        let chunk: TerrainChunk = self.base_chunk(x, z);
+        self.surface.apply(chunk);
+        return chunk;
+    }
+
+    pub fn base_chunk(cx: i32, cz: i32) -> TerrainChunk {
+        let chunk: TerrainChunk = new TerrainChunk(cx, cz);
+        let bx: i32 = cx * 16; let bz: i32 = cz * 16;
+        self.graph.prepare(bx, bz);
+        self.aquifer.prepare(bx, bz);
+        for (let x: i32 = 0; x < 16; x++) {
+            for (let z: i32 = 0; z < 16; z++) {
+                let world_x: i32 = bx + x;
+                let world_z: i32 = bz + z;
+                let highest: i32 = -65;
+                for (let y: i32 = -64; y < 320; y++) {
+                    let density: f64 = self.graph.sample(self.graph.roots[0], world_x, y, world_z);
+                    let state: i32 = self.aquifer.substance(world_x, y, world_z, density);
+                    if (state == 1) { state = self.ore(world_x, y, world_z); }
+                    if (state != 0) { highest = y; }
+                    chunk.set(x, y, z, state);
+                }
+                chunk.set_height(x, z, highest);
+            }
+        }
+        let index: i32 = 0;
+        for (let y: i32 = -16; y < 80; y++) {
+            for (let z: i32 = 0; z < 4; z++) {
+                for (let x: i32 = 0; x < 4; x++) {
+                    chunk.set_biome(index, self.biomes.quart(cx * 4 + x, y, cz * 4 + z));
+                    index++;
+                }
+            }
+        }
+        return chunk;
+    }
+
+    fn ore(x: i32, y: i32, z: i32) -> i32 {
+        if (y < -60 || y > 50) { return 1; }
+        let toggle: f64 = self.graph.sample(self.graph.roots[12], x, y, z);
+        let minimum: i32 = -60; let maximum: i32 = -8;
+        if (toggle > 0.0) { minimum = 0; maximum = 50; }
+        if (y < minimum || y > maximum) { return 1; }
+        let edge: i32 = y - minimum;
+        if (maximum - y < edge) { edge = maximum - y; }
+        let magnitude: f64 = terrain_abs(toggle);
+        if (magnitude + terrain_lerp(terrain_clamp(to_f64(edge) / 20.0, 0.0, 1.0), -0.2, 0.0) < 0.4000000059604645) { return 1; }
+        let random: TerrainRandom = self.ore_random.at(x, y, z);
+        if (random.fraction() > 0.699999988079071 ||
+            self.graph.sample(self.graph.roots[13], x, y, z) >= 0.0) { return 1; }
+        let chance: f64 = terrain_lerp(terrain_clamp((magnitude - 0.4000000059604645) / 0.20000001788139343, 0.0, 1.0),
+            0.10000000149011612, 0.30000001192092896);
+        if (random.fraction() < chance && self.graph.sample(self.graph.roots[14], x, y, z) > -0.30000001192092896) {
+            let raw: bool = random.fraction() < 0.019999999552965164;
+            if (toggle > 0.0) {
+                if (raw) { return 29376; }
+                return 25111;
+            }
+            if (raw) { return 29375; }
+            return 132;
+        }
+        if (toggle > 0.0) { return 2; }
+        return 23250;
+    }
+}

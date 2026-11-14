@@ -1,0 +1,269 @@
+module terrain_carvers;
+
+import ../../lib/std;
+import ../wire;
+import noise;
+import legacy;
+import aquifer;
+import chunk;
+import surface;
+
+fn terrain_min(a: i32, b: i32) -> i32 { if (a < b) { return a; } return b; }
+fn terrain_max(a: i32, b: i32) -> i32 { if (a > b) { return a; } return b; }
+
+class TerrainTrig {
+    let samples: str = alloc_string(65536 * 8);
+
+    pub init() {
+        for (let index: i32 = 0; index < 65536; index++) {
+            let value: f64 = terrain_sine(to_f64(index) / 10430.378350470453);
+            store64(ptr(self.samples) + to_u64(index * 8), to_u64(f64_bits(binary32(value))));
+        }
+    }
+
+    pub fn sin(value: f64) -> f64 { return self.at(to_i32(value * 10430.378350470453)); }
+    pub fn cos(value: f64) -> f64 { return self.at(to_i32(value * 10430.378350470453 + 16384.0)); }
+
+    fn at(index: i32) -> f64 {
+        return f64_from_bits(load64(ptr(self.samples) + to_u64((index & 65535) * 8)));
+    }
+}
+
+// Spawn sampling uses radians directly. The carvers use TerrainTrig's
+// quantized table, which preserves the vanilla carver's float steps.
+fn terrain_sine(angle: f64) -> f64 {
+    if (angle > 3.141592653589793) { angle -= 6.283185307179586; }
+    if (angle < -3.141592653589793) { angle += 6.283185307179586; }
+    let square: f64 = -angle * angle;
+    let sum: f64 = angle;
+    let term: f64 = angle;
+    for (let k: i32 = 2; k <= 24; k += 2) {
+        term *= square / to_f64(k * (k + 1));
+        sum += term;
+    }
+    return sum;
+}
+
+fn carver_uniform(random: LegacyRandom, from: f64, to: f64) -> f64 {
+    return binary32(from + binary32(random.fraction() * binary32(to - from)));
+}
+
+class Carvers {
+    pub let ready: bool = false;
+    let seed: i64;
+    let salt_x: []i64 = [];
+    let salt_z: []i64 = [];
+    let aquifer: Aquifer;
+    let surface: Surface;
+    let trig: TerrainTrig = new TerrainTrig();
+    let chunk: TerrainChunk;
+    let mask: str = alloc_string(98304);
+    let widths: str = alloc_string(384 * 8);
+    let replaceable: str;
+    let origin_x: i32;
+    let origin_z: i32;
+
+    pub init(seed: i64, aquifer: Aquifer, surface: Surface) {
+        self.seed = seed;
+        self.aquifer = aquifer;
+        self.surface = surface;
+        for (let kind: i32 = 0; kind < 3; kind++) {
+            let random: LegacyRandom = new LegacyRandom(seed + to_i64(kind));
+            array_append(self.salt_x, random.long());
+            array_append(self.salt_z, random.long());
+        }
+        let data: Bytes = read_blob("data/overworld-carver-774.bin", 32768);
+        if (data == null || data.size != 29671) { return; }
+        self.replaceable = data.data;
+        self.ready = true;
+    }
+
+    pub fn apply(chunk: TerrainChunk) -> void {
+        self.chunk = chunk;
+        self.origin_x = chunk.x * 16;
+        self.origin_z = chunk.z * 16;
+        memset(ptr(self.mask), 0, 98304);
+        let random: LegacyRandom = new LegacyRandom(self.seed);
+        for (let dx: i32 = -8; dx <= 8; dx++) {
+            for (let dz: i32 = -8; dz <= 8; dz++) {
+                let x: i32 = chunk.x + dx;
+                let z: i32 = chunk.z + dz;
+                for (let kind: i32 = 0; kind < 3; kind++) {
+                    let seed: i64 = self.seed + to_i64(kind);
+                    random.reset((to_i64(x) * self.salt_x[kind]) ^ (to_i64(z) * self.salt_z[kind]) ^ seed);
+                    let roll: f64 = random.fraction();
+                    if (kind == 0 && roll <= 0.15000000596046448) { self.caves(random, x, z, 180); }
+                    else if (kind == 1 && roll <= 0.07000000029802322) { self.caves(random, x, z, 47); }
+                    else if (kind == 2 && roll <= 0.009999999776482582) { self.canyon(random, x, z); }
+                }
+            }
+        }
+        for (let z: i32 = 0; z < 16; z++) {
+            for (let x: i32 = 0; x < 16; x++) {
+                let y: i32 = chunk.height(x, z);
+                while (y >= -64 && (chunk.block(x, y, z) == 0 || chunk.block(x, y, z) == 15091)) { y--; }
+                chunk.set_height(x, z, y);
+            }
+        }
+        self.chunk = null;
+    }
+
+    fn caves(random: LegacyRandom, x: i32, z: i32, maximum: i32) -> void {
+        let rooms: i32 = random.bounded(random.bounded(random.bounded(15) + 1) + 1);
+        for (let room: i32 = 0; room < rooms; room++) {
+            let wx: f64 = to_f64(x * 16 + random.bounded(16));
+            let wy: f64 = to_f64(-56 + random.bounded(maximum + 57));
+            let wz: f64 = to_f64(z * 16 + random.bounded(16));
+            let horizontal: f64 = carver_uniform(random, 0.699999988079071, 1.399999976158142);
+            let vertical: f64 = carver_uniform(random, 0.800000011920929, 1.2999999523162842);
+            let floor: f64 = carver_uniform(random, -1.0, -0.4000000059604645);
+            let tunnels: i32 = 1;
+            if (random.bounded(4) == 0) {
+                let scale: f64 = carver_uniform(random, 0.10000000149011612, 0.8999999761581421);
+                let radius: f64 = 1.5 + binary32(1.0 + binary32(random.fraction() * 6.0));
+                self.ellipsoid(wx + 1.0, wy, wz, radius, radius * scale, floor, false);
+                tunnels += random.bounded(4);
+            }
+            for (let index: i32 = 0; index < tunnels; index++) {
+                let yaw: f64 = binary32(random.fraction() * 6.2831854820251465);
+                let pitch: f64 = binary32(random.fraction() - 0.5) / 4.0;
+                let width: f64 = random.fraction() * 2.0;
+                width = binary32(width + random.fraction());
+                if (random.bounded(10) == 0) {
+                    let size: f64 = random.fraction() * random.fraction();
+                    width = binary32(width * binary32(binary32(size * 3.0) + 1.0));
+                }
+                let length: i32 = 112 - random.bounded(28);
+                self.tunnel(random.long(), wx, wy, wz, horizontal, vertical, floor, width, yaw, pitch, 0, length);
+            }
+        }
+    }
+
+    fn tunnel(seed: i64, x: f64, y: f64, z: f64, horizontal: f64, vertical: f64, floor: f64,
+              width: f64, yaw: f64, pitch: f64, start: i32, length: i32) -> void {
+        let random: LegacyRandom = new LegacyRandom(seed);
+        let branch: i32 = random.bounded(length / 2) + length / 4;
+        let damping: f64 = 0.699999988079071;
+        if (random.bounded(6) == 0) { damping = 0.9200000166893005; }
+        let turn: f64 = 0.0; let drift: f64 = 0.0;
+        for (let step: i32 = start; step < length; step++) {
+            let angle: f64 = binary32(binary32(3.1415927410125732 * to_f64(step)) / to_f64(length));
+            let radius: f64 = 1.5 + binary32(self.trig.sin(angle) * width);
+            let cos: f64 = self.trig.cos(pitch);
+            x += binary32(self.trig.cos(yaw) * cos);
+            y += self.trig.sin(pitch);
+            z += binary32(self.trig.sin(yaw) * cos);
+            pitch = binary32(binary32(pitch * damping) + binary32(drift * 0.10000000149011612));
+            yaw = binary32(yaw + binary32(turn * 0.10000000149011612));
+            drift = self.drift(random, drift, 0.8999999761581421, 2.0);
+            turn = self.drift(random, turn, 0.75, 4.0);
+            if (step == branch && width > 1.0) {
+                let left: i64 = random.long();
+                let left_size: f64 = binary32(random.fraction() * 0.5 + 0.5);
+                self.tunnel(left, x, y, z, horizontal, vertical, floor, left_size,
+                    binary32(yaw - 1.5707963705062866), binary32(pitch / 3.0), step, length);
+                let right: i64 = random.long();
+                let right_size: f64 = binary32(random.fraction() * 0.5 + 0.5);
+                self.tunnel(right, x, y, z, horizontal, vertical, floor, right_size,
+                    binary32(yaw + 1.5707963705062866), binary32(pitch / 3.0), step, length);
+                return;
+            }
+            if (random.bounded(4) == 0) { continue; }
+            if (!self.reaches(x, z, step, length, width)) { return; }
+            self.ellipsoid(x, y, z, radius * horizontal, radius * vertical, floor, false);
+        }
+    }
+
+    fn drift(random: LegacyRandom, current: f64, damping: f64, scale: f64) -> f64 {
+        let offset: f64 = random.fraction() - random.fraction();
+        offset = binary32(binary32(offset * random.fraction()) * scale);
+        return binary32(binary32(current * damping) + offset);
+    }
+
+    fn canyon(random: LegacyRandom, x: i32, z: i32) -> void {
+        let wx: f64 = to_f64(x * 16 + random.bounded(16));
+        let wy: f64 = to_f64(10 + random.bounded(58));
+        let wz: f64 = to_f64(z * 16 + random.bounded(16));
+        let yaw: f64 = binary32(random.fraction() * 6.2831854820251465);
+        let pitch: f64 = carver_uniform(random, -0.125, 0.125);
+        let width: f64 = binary32(binary32(random.fraction() * 2.0 + 2.0) + random.fraction() * 2.0);
+        let length: i32 = to_i32(binary32(112.0 * carver_uniform(random, 0.75, 1.0)));
+        self.ravine(new LegacyRandom(random.long()), wx, wy, wz, yaw, pitch, width, length);
+    }
+
+    fn ravine(random: LegacyRandom, x: f64, y: f64, z: f64, yaw: f64, pitch: f64, width: f64, length: i32) -> void {
+        let factor: f64 = 1.0;
+        for (let cell: i32 = 0; cell < 384; cell++) {
+            if (cell == 0 || random.bounded(3) == 0) { factor = binary32(1.0 + binary32(random.fraction() * random.fraction())); }
+            store64(ptr(self.widths) + to_u64(cell * 8), to_u64(f64_bits(binary32(factor * factor))));
+        }
+        let turn: f64 = 0.0; let drift: f64 = 0.0;
+        for (let step: i32 = 0; step < length; step++) {
+            let angle: f64 = binary32(binary32(3.1415927410125732 * to_f64(step)) / to_f64(length));
+            let radius: f64 = 1.5 + binary32(self.trig.sin(angle) * width);
+            let horizontal: f64 = radius * carver_uniform(random, 0.75, 1.0);
+            let vertical: f64 = radius * 3.0 * carver_uniform(random, 0.75, 1.0);
+            let cos: f64 = self.trig.cos(pitch);
+            x += binary32(self.trig.cos(yaw) * cos);
+            y += self.trig.sin(pitch);
+            z += binary32(self.trig.sin(yaw) * cos);
+            pitch = binary32(binary32(pitch * 0.699999988079071) + binary32(drift * 0.05000000074505806));
+            yaw = binary32(yaw + binary32(turn * 0.05000000074505806));
+            drift = self.drift(random, drift, 0.800000011920929, 2.0);
+            turn = self.drift(random, turn, 0.5, 4.0);
+            if (random.bounded(4) == 0) { continue; }
+            if (!self.reaches(x, z, step, length, width)) { return; }
+            self.ellipsoid(x, y, z, horizontal, vertical, -1.0, true);
+        }
+    }
+
+    fn reaches(x: f64, z: f64, step: i32, length: i32, width: f64) -> bool {
+        let dx: f64 = x - to_f64(self.origin_x + 8); let dz: f64 = z - to_f64(self.origin_z + 8);
+        let remaining: f64 = to_f64(length - step);
+        let bound: f64 = binary32(binary32(width + 2.0) + 16.0);
+        return dx * dx + dz * dz - remaining * remaining <= bound * bound;
+    }
+
+    fn ellipsoid(x: f64, y: f64, z: f64, radius: f64, height: f64, floor: f64, canyon: bool) -> void {
+        let scope: f64 = 16.0 + radius * 2.0;
+        if (terrain_abs(x - to_f64(self.origin_x + 8)) > scope ||
+            terrain_abs(z - to_f64(self.origin_z + 8)) > scope) { return; }
+        let x_min: i32 = terrain_max(to_i32(terrain_floor(x - radius)) - self.origin_x - 1, 0);
+        let x_max: i32 = terrain_min(to_i32(terrain_floor(x + radius)) - self.origin_x, 15);
+        let z_min: i32 = terrain_max(to_i32(terrain_floor(z - radius)) - self.origin_z - 1, 0);
+        let z_max: i32 = terrain_min(to_i32(terrain_floor(z + radius)) - self.origin_z, 15);
+        let y_min: i32 = terrain_max(to_i32(terrain_floor(y - height)) - 1, -63);
+        let y_max: i32 = terrain_min(to_i32(terrain_floor(y + height)) + 1, 312);
+        for (let bx: i32 = x_min; bx <= x_max; bx++) {
+            let wx: i32 = self.origin_x + bx;
+            let dx: f64 = (to_f64(wx) + 0.5 - x) / radius;
+            for (let bz: i32 = z_min; bz <= z_max; bz++) {
+                let wz: i32 = self.origin_z + bz;
+                let dz: f64 = (to_f64(wz) + 0.5 - z) / radius;
+                let distance: f64 = dx * dx + dz * dz;
+                if (distance >= 1.0) { continue; }
+                let surface: bool = false;
+                for (let by: i32 = y_max; by > y_min; by--) {
+                    let dy: f64 = (to_f64(by) - 0.5 - y) / height;
+                    if (canyon) {
+                        let multiplier: f64 = f64_from_bits(load64(ptr(self.widths) + to_u64((by + 63) * 8)));
+                        if (distance * multiplier + dy * dy / 6.0 >= 1.0) { continue; }
+                    } else if (dy <= floor || dx * dx + dy * dy + dz * dz >= 1.0) { continue; }
+                    let address: u64 = ptr(self.mask) + to_u64((by + 64) * 256 + bz * 16 + bx);
+                    if (load8(address) != 0) { continue; }
+                    store8(address, 1);
+                    let state: i32 = self.chunk.block(bx, by, bz);
+                    if (state == 9 || state == 8718) { surface = true; }
+                    if (load8(ptr(self.replaceable) + to_u64(state)) == 0) { continue; }
+                    let material: i32 = 102;
+                    if (by > -56) { material = self.aquifer.substance(wx, by, wz, 0.0); }
+                    if (material == 1) { continue; }
+                    self.chunk.set(bx, by, bz, material);
+                    if (surface && self.chunk.block(bx, by - 1, bz) == 10) {
+                        self.surface.repair_floor(self.chunk, bx, by - 1, bz, material != 0);
+                    }
+                }
+            }
+        }
+    }
+}

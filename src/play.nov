@@ -206,8 +206,9 @@ fn stream_chunks(player: Connection, level: World, now: i64) -> void {
     let sent: i32 = 0;
     while (player.next_chunk < len(player.view_chunks) && sent < 4 && player.waiting() < 262144) {
         let position: ChunkPosition = player.view_chunks[player.next_chunk];
+        if (player.has_sent(position.x, position.z)) { player.next_chunk++; continue; }
+        if (!level.prepare_chunk(position.x, position.z)) { break; }
         player.next_chunk++;
-        if (player.has_sent(position.x, position.z)) { continue; }
         let chunk: Bytes = level.chunk(position.x, position.z);
         if (chunk == null) { continue; }
         if (sent == 0) { player.send(12, new Bytes()); }

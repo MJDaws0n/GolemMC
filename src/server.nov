@@ -40,7 +40,7 @@ class Server {
         if (!self.crafting.ready) { self.error = "Cannot load crafting recipes"; return; }
         self.configuration = read_blob("data/configuration-774.bin", 1048576);
         if (self.configuration == null) { self.error = "Cannot load protocol 774 registries. Run from the GolemMC checkout."; return; }
-        self.world = new World(options.world, options.source, options.seed);
+        self.world = new World(options.world, options.source, options.seed, options.level_type);
         self.error = self.world.error;
     }
 

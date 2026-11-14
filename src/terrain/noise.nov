@@ -1,0 +1,270 @@
+module terrain_noise;
+
+import ../../lib/std;
+import ../../lib/digest;
+
+fn terrain_clamp(value: f64, low: f64, high: f64) -> f64 {
+    if (value < low) { return low; }
+    if (value > high) { return high; }
+    return value;
+}
+
+fn terrain_abs(value: f64) -> f64 {
+    if (value < 0.0) { return -value; }
+    return value;
+}
+
+fn terrain_lerp(t: f64, a: f64, b: f64) -> f64 { return a + t * (b - a); }
+
+fn terrain_floor(value: f64) -> i64 {
+    let integer: i64 = f64_to_i64(value);
+    if (value < i64_to_f64(integer)) { return integer - 1; }
+    return integer;
+}
+
+// Climate coordinates and spline arithmetic use Java float rounding.
+fn binary32(value: f64) -> f64 {
+    let bits: u64 = to_u64(f64_bits(value));
+    return f64_from_bits((bits + 268435455 + ((bits >> 29) & 1)) & 18446744073172680704);
+}
+
+fn terrain_floor_div(value: i32, divisor: i32) -> i32 {
+    let quotient: i32 = value / divisor;
+    if (value < 0 && quotient * divisor != value) { return quotient - 1; }
+    return quotient;
+}
+
+fn terrain_wrap(value: f64) -> f64 {
+    return value - i64_to_f64(terrain_floor(value / 33554432.0 + 0.5)) * 33554432.0;
+}
+
+fn terrain_rotate(value: u64, shift: u64) -> u64 { return (value << shift) | (value >> (64 - shift)); }
+
+fn terrain_mix(value: u64) -> u64 {
+    value = (value ^ (value >> 30)) * 13787848793156543929;
+    value = (value ^ (value >> 27)) * 10723151780598845931;
+    return value ^ (value >> 31);
+}
+
+fn terrain_seed_at(x: i32, y: i32, z: i32) -> u64 {
+    let x_hash: i32 = x * 3129871;
+    let mixed: i64 = to_i64(x_hash) ^ (to_i64(z) * 116129781) ^ to_i64(y);
+    return to_u64((mixed * mixed * 42317861 + mixed * 11) >> 16);
+}
+
+fn digest_long(data: str, offset: i32) -> u64 {
+    let value: u64 = 0;
+    for (let index: i32 = 0; index < 8; index++) { value = (value << 8) | to_u64(byte_at(data, offset + index)); }
+    return value;
+}
+
+class TerrainRandom {
+    pub let low: u64;
+    pub let high: u64;
+
+    pub init(low: u64, high: u64) {
+        self.low = low;
+        self.high = high;
+        if (low == 0 && high == 0) { self.low = 11400714819323198485; self.high = 7640891576956012809; }
+    }
+
+    pub static fn seeded(seed: i64) -> TerrainRandom {
+        let low: u64 = to_u64(seed) ^ 7640891576956012809;
+        return new TerrainRandom(terrain_mix(low), terrain_mix(low + 11400714819323198485));
+    }
+
+    pub fn next() -> u64 {
+        let a: u64 = self.low;
+        let b: u64 = self.high;
+        let result: u64 = terrain_rotate(a + b, 17) + a;
+        b = b ^ a;
+        self.low = terrain_rotate(a, 49) ^ b ^ (b << 21);
+        self.high = terrain_rotate(b, 28);
+        return result;
+    }
+
+    pub fn bounded(bound: i32) -> i32 {
+        let range: u64 = to_u64(bound);
+        let threshold: u64 = (4294967296 - range) % range;
+        let product: u64 = (self.next() & 4294967295) * range;
+        while ((product & 4294967295) < threshold) { product = (self.next() & 4294967295) * range; }
+        return to_i32(product >> 32);
+    }
+
+    pub fn fraction() -> f64 { return i64_to_f64(to_i64(self.next() >> 40)) / 16777216.0; }
+
+    pub fn uniform() -> f64 { return i64_to_f64(to_i64(self.next() >> 11)) * 0.00000000000000011102230246251565; }
+
+    pub fn fork() -> TerrainRandom {
+        let low: u64 = self.next();
+        return new TerrainRandom(low, self.next());
+    }
+
+    pub fn named(name: str) -> TerrainRandom {
+        let hash: str = digest_md5(name, len(name));
+        return new TerrainRandom(self.low ^ digest_long(hash, 0), self.high ^ digest_long(hash, 8));
+    }
+
+    pub fn at(x: i32, y: i32, z: i32) -> TerrainRandom {
+        return new TerrainRandom(self.low ^ terrain_seed_at(x, y, z), self.high);
+    }
+}
+
+fn terrain_fade(x: f64) -> f64 { return x * x * x * (x * (x * 6.0 - 15.0) + 10.0); }
+
+fn terrain_dot(index: i32, x: f64, y: f64, z: f64) -> f64 {
+    let gradient: i32 = index & 15;
+    if (gradient == 0 || gradient == 12) { return x + y; }
+    if (gradient == 1 || gradient == 14) { return -x + y; }
+    if (gradient == 2) { return x - y; }
+    if (gradient == 3) { return -x - y; }
+    if (gradient == 4) { return x + z; }
+    if (gradient == 5) { return -x + z; }
+    if (gradient == 6) { return x - z; }
+    if (gradient == 7) { return -x - z; }
+    if (gradient == 8) { return y + z; }
+    if (gradient == 9 || gradient == 13) { return -y + z; }
+    if (gradient == 10) { return y - z; }
+    return -y - z;
+}
+
+class ImprovedNoise {
+    let offset_x: f64;
+    let offset_y: f64;
+    let offset_z: f64;
+    let permutation: str = alloc_string(256);
+
+    pub init(random: TerrainRandom) {
+        self.offset_x = random.uniform() * 256.0;
+        self.offset_y = random.uniform() * 256.0;
+        self.offset_z = random.uniform() * 256.0;
+        for (let index: i32 = 0; index < 256; index++) { string_set_byte(self.permutation, index, index); }
+        for (let index: i32 = 0; index < 256; index++) {
+            let other: i32 = index + random.bounded(256 - index);
+            let value: i32 = byte_at(self.permutation, index);
+            string_set_byte(self.permutation, index, byte_at(self.permutation, other));
+            string_set_byte(self.permutation, other, value);
+        }
+    }
+
+    fn perm(value: i32) -> i32 { return byte_at(self.permutation, value & 255); }
+
+    pub fn sample(x: f64, y: f64, z: f64, step: f64 = 0.0, limit: f64 = 0.0) -> f64 {
+        x += self.offset_x; y += self.offset_y; z += self.offset_z;
+        let ix: i32 = to_i32(terrain_floor(x));
+        let iy: i32 = to_i32(terrain_floor(y));
+        let iz: i32 = to_i32(terrain_floor(z));
+        x -= to_f64(ix); y -= to_f64(iy); z -= to_f64(iz);
+        let dy: f64 = y;
+        if (step != 0.0) {
+            let top: f64 = y;
+            if (limit >= 0.0 && limit < top) { top = limit; }
+            dy -= i64_to_f64(terrain_floor(top / step + 0.00000010000000116860974)) * step;
+        }
+        let a: i32 = self.perm(ix) + iy;
+        let b: i32 = self.perm(ix + 1) + iy;
+        let aa: i32 = self.perm(a) + iz; let ab: i32 = self.perm(a + 1) + iz;
+        let ba: i32 = self.perm(b) + iz; let bb: i32 = self.perm(b + 1) + iz;
+        let u: f64 = terrain_fade(x);
+        let v: f64 = terrain_fade(y);
+        let w: f64 = terrain_fade(z);
+        let n00: f64 = terrain_lerp(u, terrain_dot(self.perm(aa), x, dy, z), terrain_dot(self.perm(ba), x - 1.0, dy, z));
+        let n10: f64 = terrain_lerp(u, terrain_dot(self.perm(ab), x, dy - 1.0, z), terrain_dot(self.perm(bb), x - 1.0, dy - 1.0, z));
+        let n01: f64 = terrain_lerp(u, terrain_dot(self.perm(aa + 1), x, dy, z - 1.0), terrain_dot(self.perm(ba + 1), x - 1.0, dy, z - 1.0));
+        let n11: f64 = terrain_lerp(u, terrain_dot(self.perm(ab + 1), x, dy - 1.0, z - 1.0), terrain_dot(self.perm(bb + 1), x - 1.0, dy - 1.0, z - 1.0));
+        return terrain_lerp(w, terrain_lerp(v, n00, n10), terrain_lerp(v, n01, n11));
+    }
+}
+
+class DoublePerlin {
+    let first: []ImprovedNoise = [];
+    let second: []ImprovedNoise = [];
+    let frequencies: []f64 = [];
+    let amplitudes: []f64 = [];
+    let factor: f64 = 0.0;
+
+    pub init(random: TerrainRandom, octave: i32, weights: []f64) {
+        let first: TerrainRandom = random.fork();
+        let second: TerrainRandom = random.fork();
+        let size: i32 = len(weights);
+        let scale: f64 = 1.0;
+        let frequency: f64 = 1.0;
+        for (let index: i32 = 0; index < size; index++) { scale *= 2.0; }
+        for (let index: i32 = octave; index < 0; index++) { frequency *= 0.5; }
+        let amplitude: f64 = (scale * 0.5) / (scale - 1.0);
+        let first_index: i32 = -1;
+        let last_index: i32 = -1;
+        for (let index: i32 = 0; index < size; index++) {
+            if (weights[index] != 0.0) {
+                if (first_index < 0) { first_index = index; }
+                last_index = index;
+                let name: str = "octave_" + to_str(octave + index);
+                array_append(self.first, new ImprovedNoise(first.named(name)));
+                array_append(self.second, new ImprovedNoise(second.named(name)));
+                array_append(self.frequencies, frequency);
+                array_append(self.amplitudes, amplitude * weights[index]);
+            }
+            frequency *= 2.0;
+            amplitude *= 0.5;
+        }
+        if (first_index >= 0) { self.factor = (1.0 / 6.0) / (0.1 * (1.0 + 1.0 / to_f64(last_index - first_index + 1))); }
+    }
+
+    pub fn sample(x: f64, y: f64, z: f64) -> f64 {
+        let one: f64 = 0.0;
+        let two: f64 = 0.0;
+        let sx: f64 = x * 1.0181268882175227;
+        let sy: f64 = y * 1.0181268882175227;
+        let sz: f64 = z * 1.0181268882175227;
+        for (let index: i32 = 0; index < len(self.first); index++) {
+            let f: f64 = self.frequencies[index];
+            let weight: f64 = self.amplitudes[index];
+            one += weight * self.first[index].sample(terrain_wrap(x * f), terrain_wrap(y * f), terrain_wrap(z * f));
+            two += weight * self.second[index].sample(terrain_wrap(sx * f), terrain_wrap(sy * f), terrain_wrap(sz * f));
+        }
+        return (one + two) * self.factor;
+    }
+}
+
+class BlendedTerrainNoise {
+    let low: []ImprovedNoise = [];
+    let high: []ImprovedNoise = [];
+    let blend: []ImprovedNoise = [];
+    let xz_scale: f64;
+    let y_scale: f64;
+    let xz_factor: f64;
+    let y_factor: f64;
+    let smear: f64;
+
+    pub init(random: TerrainRandom, xz: f64, y: f64, xz_factor: f64, y_factor: f64, smear: f64) {
+        self.xz_scale = xz * 684.412;
+        self.y_scale = y * 684.412;
+        self.xz_factor = xz_factor;
+        self.y_factor = y_factor;
+        self.smear = self.y_scale * smear;
+        for (let index: i32 = 0; index < 16; index++) { array_append(self.low, new ImprovedNoise(random)); }
+        for (let index: i32 = 0; index < 16; index++) { array_append(self.high, new ImprovedNoise(random)); }
+        for (let index: i32 = 0; index < 8; index++) { array_append(self.blend, new ImprovedNoise(random)); }
+    }
+
+    pub fn sample(x: f64, y: f64, z: f64) -> f64 {
+        x *= self.xz_scale; y *= self.y_scale; z *= self.xz_scale;
+        let blend: f64 = blended_octaves(self.blend, x / self.xz_factor, y / self.y_factor, z / self.xz_factor, self.smear / self.y_factor);
+        let t: f64 = (blend / 10.0 + 1.0) / 2.0;
+        if (t <= 0.0) { return blended_octaves(self.low, x, y, z, self.smear) / 512.0 / 128.0; }
+        if (t >= 1.0) { return blended_octaves(self.high, x, y, z, self.smear) / 512.0 / 128.0; }
+        let a: f64 = blended_octaves(self.low, x, y, z, self.smear) / 512.0;
+        let b: f64 = blended_octaves(self.high, x, y, z, self.smear) / 512.0;
+        return terrain_lerp(t, a, b) / 128.0;
+    }
+}
+
+fn blended_octaves(samples: []ImprovedNoise, x: f64, y: f64, z: f64, smear: f64) -> f64 {
+    let sum: f64 = 0.0;
+    let freq: f64 = 1.0;
+    for (let index: i32 = 0; index < len(samples); index++) {
+        sum += samples[index].sample(terrain_wrap(x * freq), terrain_wrap(y * freq), terrain_wrap(z * freq), smear * freq, y * freq) / freq;
+        freq *= 0.5;
+    }
+    return sum;
+}

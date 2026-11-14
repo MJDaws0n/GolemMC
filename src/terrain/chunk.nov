@@ -1,0 +1,37 @@
+module terrain_chunk;
+
+import ../../lib/std;
+
+class TerrainChunk {
+    pub let x: i32;
+    pub let z: i32;
+    let states: str = alloc_string(98304 * 4);
+    let biomes: str = alloc_string(1536);
+    let heights: str = alloc_string(1024);
+
+    pub init(x: i32, z: i32) {
+        self.x = x; self.z = z;
+    }
+
+    pub fn state(index: i32) -> i32 { return load32(ptr(self.states) + to_u64(index * 4)); }
+
+    pub fn block(x: i32, y: i32, z: i32) -> i32 {
+        if (y < -64 || y >= 320) { return 0; }
+        return self.state((y + 64) * 256 + (z & 15) * 16 + (x & 15));
+    }
+
+    pub fn set(x: i32, y: i32, z: i32, state: i32) -> void {
+        let index: i32 = (y + 64) * 256 + z * 16 + x;
+        store32(ptr(self.states) + to_u64(index * 4), state);
+    }
+
+    pub fn biome(index: i32) -> i32 { return load8(ptr(self.biomes) + to_u64(index)); }
+
+    pub fn set_biome(index: i32, biome: i32) -> void { store8(ptr(self.biomes) + to_u64(index), biome); }
+
+    pub fn height(x: i32, z: i32) -> i32 { return load32(ptr(self.heights) + to_u64((z * 16 + x) * 4)); }
+
+    pub fn set_height(x: i32, z: i32, height: i32) -> void {
+        store32(ptr(self.heights) + to_u64((z * 16 + x) * 4), height);
+    }
+}

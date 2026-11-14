@@ -46,13 +46,13 @@ async function reservePort () {
 async function start (directory, extras = '') {
   const port = await reservePort()
   const properties = path.join(directory, 'server.properties')
-  fs.writeFileSync(properties, 'server-port=' + port + '\nview-distance=2\n' +
+  fs.writeFileSync(properties, 'server-port=' + port + '\nview-distance=2\nlevel-type=minecraft:flat\n' +
     'motd=Testing "Golem" \\ status\nlevel-name=' + path.join(directory, 'world') + '\n' + extras)
   const process = spawn(executable, [properties], { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] })
   let logs = ''
   process.stdout.on('data', chunk => { logs += chunk })
   process.stderr.on('data', chunk => { logs += chunk })
-  for (let retry = 0; retry < 100; retry++) {
+  for (let retry = 0; retry < 400; retry++) {
     if (logs.includes('is listening')) return { process, port, logs: () => logs }
     if (process.exitCode !== null || process.signalCode !== null) break
     await delay(20)
@@ -521,6 +521,60 @@ test('lighting follows edits across a chunk boundary, movement, and restart', { 
     const surface = source.heightmaps.find(h => h.type === 'world_surface').data
     const column = 2 * 16 + 15
     assert.equal((BigInt(surface[Math.floor(column / 7)]) >> BigInt((column % 7) * 9)) & 511n, 5n)
+  } finally {
+    await disconnect(bot)
+    await stop(server)
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('native Overworld streams generated terrain and keeps changes across restart', { timeout: 50000 }, async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'golem-native-test-'))
+  const properties = 'level-type=minecraft:normal\nlevel-seed=-7828337448752309328\n'
+  let server
+  let bot
+  try {
+    server = await start(directory, properties)
+    bot = client(server.port, 'TerrainProbe')
+    const spawnPacket = packet(bot, 'position')
+    const first = packet(bot, 'map_chunk')
+    const spawn = await spawnPacket
+    const message = await first
+    assert.equal(message.x, Math.floor(spawn.x / 16))
+    assert.equal(message.z, Math.floor(spawn.z / 16))
+    const terrain = new Chunk()
+    terrain.load(message.chunkData)
+    const states = new Set()
+    const elevations = new Set()
+    for (let z = 0; z < 16; z++) {
+      for (let x = 0; x < 16; x++) {
+        assert.equal(terrain.getBlockStateId({ x, y: -64, z }), 85)
+        for (let y = 319; y >= -64; y--) {
+          const state = terrain.getBlockStateId({ x, y, z })
+          if (state === 0 || state === 15091) continue
+          states.add(state)
+          elevations.add(y)
+          break
+        }
+      }
+    }
+    assert.ok(elevations.size > 1, 'seeded terrain varies within the chunk')
+    assert.ok([...states].some(state => state !== 85))
+    assert.ok(message.skyLight.length > 0)
+    const spawnBlock = { x: Math.floor(spawn.x), y: Math.floor(spawn.y) - 1, z: Math.floor(spawn.z) }
+    const expected = terrain.getBlockStateId({ ...spawnBlock, x: spawnBlock.x & 15, z: spawnBlock.z & 15 })
+    assert.ok(expected > 0 && expected !== 86 && expected !== 102, 'spawn has a dry floor')
+    const removed = packet(bot, 'block_change', change =>
+      change.location.x === spawnBlock.x && change.location.y === spawnBlock.y && change.location.z === spawnBlock.z)
+    bot.write('block_dig', { status: 0, location: spawnBlock, face: 1, sequence: 1 })
+    assert.equal((await removed).type, 0)
+    await disconnect(bot)
+    await stop(server)
+    server = await start(directory, properties)
+    bot = client(server.port, 'TerrainProbe')
+    const reloaded = await packet(bot, 'map_chunk', chunk => chunk.x === message.x && chunk.z === message.z)
+    assert.equal(blockAt(reloaded, spawnBlock.x & 15, spawnBlock.y, spawnBlock.z & 15), 0)
+    assert.equal(blockAt(reloaded, 0, -64, 0), 85)
   } finally {
     await disconnect(bot)
     await stop(server)

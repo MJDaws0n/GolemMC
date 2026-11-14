@@ -1,0 +1,236 @@
+module terrain_density;
+
+import ../../lib/std;
+import ../wire;
+import noise;
+
+class DensityNode {
+    pub let kind: i32;
+    pub let a: i32;
+    pub let b: i32;
+    pub let c: i32;
+    pub let d: i32;
+    pub let low: f64;
+    pub let high: f64;
+    pub let first: f64;
+    pub let second: f64;
+    pub let fifth: f64;
+
+    pub init(reader: Reader) {
+        self.kind = reader.int32(); self.a = reader.int32(); self.b = reader.int32();
+        self.c = reader.int32(); self.d = reader.int32();
+        self.low = reader.double(); self.high = reader.double();
+        self.first = reader.double(); self.second = reader.double(); self.fifth = reader.double();
+    }
+}
+
+class SplinePoint {
+    pub let value: i32;
+    pub let location: f64;
+    pub let derivative: f64;
+
+    pub init(reader: Reader) {
+        self.value = reader.int32(); self.location = reader.double(); self.derivative = reader.double();
+    }
+}
+
+// One evaluator serves a whole chunk. Cache keys are per node and coordinate,
+// so recursive spline and interpolation calls can share repeated samples.
+class DensityGraph {
+    pub let ready: bool = false;
+    pub let surface_input: Reader;
+    pub let roots: []i32 = [];
+    let nodes: []DensityNode = [];
+    let points: []SplinePoint = [];
+    pub let noises: []DoublePerlin = [];
+    pub let random: TerrainRandom;
+    let old_noise: BlendedTerrainNoise;
+    let caches: str;
+    let interpolation: str;
+    let origin_x: i32 = 0;
+    let origin_z: i32 = 0;
+    let interpolators: []i32 = [];
+    let interpolation_ids: []i32 = [];
+
+    pub init(seed: i64) {
+        let data: Bytes = read_blob("data/overworld-noise-774.bin", 262144);
+        if (data == null) { return; }
+        let input: Reader = new Reader(data.data, 0, data.size);
+        if (input.int32() != 1196306482) { return; } // GN02
+        let noise_count: i32 = input.int32();
+        let node_count: i32 = input.int32();
+        let point_count: i32 = input.int32();
+        if (noise_count < 1 || noise_count > 128 || node_count < 1 || node_count > 4096 || point_count < 1 || point_count > 8192) { return; }
+        for (let index: i32 = 0; index < 24; index++) { array_append(self.roots, input.int32()); }
+        self.random = TerrainRandom.seeded(seed).fork();
+        for (let index: i32 = 0; index < noise_count; index++) {
+            let length: i32 = input.short();
+            let name: str = input.fixed_text(length);
+            let first: i32 = input.int32();
+            let octaves: i32 = input.int32();
+            if (!input.valid || octaves < 1 || octaves > 32) { return; }
+            let amplitudes: []f64 = [];
+            for (let octave: i32 = 0; octave < octaves; octave++) { array_append(amplitudes, input.double()); }
+            array_append(self.noises, new DoublePerlin(self.random.named(name), first, amplitudes));
+        }
+        for (let index: i32 = 0; index < node_count; index++) {
+            let node: DensityNode = new DensityNode(input);
+            array_append(self.nodes, node);
+            let cache_index: i32 = -1;
+            if (node.kind == 21) { self.old_noise = new BlendedTerrainNoise(self.random.named("minecraft:terrain"), node.low, node.high, node.first, node.second, node.fifth); }
+            if (node.kind == 22) {
+                cache_index = len(self.interpolators);
+                array_append(self.interpolators, node.a);
+            }
+            array_append(self.interpolation_ids, cache_index);
+        }
+        for (let index: i32 = 0; index < point_count; index++) { array_append(self.points, new SplinePoint(input)); }
+        self.caches = alloc_string(node_count * 24);
+        memset(ptr(self.caches), 0, node_count * 24);
+        self.interpolation = alloc_string(len(self.interpolators) * 1225 * 8);
+        self.surface_input = input;
+        self.ready = input.valid && self.old_noise != null;
+    }
+
+    pub fn prepare(origin_x: i32, origin_z: i32) -> void {
+        self.origin_x = origin_x;
+        self.origin_z = origin_z;
+        for (let index: i32 = 0; index < len(self.interpolators); index++) {
+            let child: i32 = self.interpolators[index];
+            for (let x: i32 = 0; x < 5; x++) {
+                for (let z: i32 = 0; z < 5; z++) {
+                    for (let y: i32 = 0; y <= 48; y++) {
+                        let value: f64 = self.sample(child, origin_x + x * 4, y * 8 - 64, origin_z + z * 4);
+                        let key: i32 = index * 1225 + (x * 5 + z) * 49 + y;
+                        store64(ptr(self.interpolation) + to_u64(key * 8), to_u64(f64_bits(value)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn interpolated(id: i32, child: i32, x: i32, y: i32, z: i32) -> f64 {
+        let dx: i32 = x - self.origin_x;
+        let dz: i32 = z - self.origin_z;
+        if (dx < 0 || dx >= 16 || dz < 0 || dz >= 16 || y < -64 || y >= 320) { return self.sample(child, x, y, z); }
+        let index: i32 = self.interpolation_ids[id] * 1225 + ((dx >> 2) * 5 + (dz >> 2)) * 49 + ((y + 64) >> 3);
+        let a: u64 = ptr(self.interpolation) + to_u64(index * 8);
+        let ty: f64 = to_f64(y & 7) / 8.0;
+        let a00: f64 = terrain_lerp(ty, f64_from_bits(load64(a)), f64_from_bits(load64(a + 8)));
+        let a01: f64 = terrain_lerp(ty, f64_from_bits(load64(a + 392)), f64_from_bits(load64(a + 400)));
+        let a10: f64 = terrain_lerp(ty, f64_from_bits(load64(a + 1960)), f64_from_bits(load64(a + 1968)));
+        let a11: f64 = terrain_lerp(ty, f64_from_bits(load64(a + 2352)), f64_from_bits(load64(a + 2360)));
+        let tx: f64 = to_f64(dx & 3) / 4.0;
+        return terrain_lerp(to_f64(dz & 3) / 4.0, terrain_lerp(tx, a00, a10), terrain_lerp(tx, a01, a11));
+    }
+
+    fn memoized(id: i32, node: DensityNode, x: i32, y: i32, z: i32) -> f64 {
+        if (node.kind == 23) { x = (x >> 2) * 4; z = (z >> 2) * 4; y = 0; }
+        else if (node.kind == 24) { y = 0; }
+        let entry: u64 = ptr(self.caches) + to_u64(id * 24);
+        if (load32(entry) != 0 && load32(entry + 4) == x && load32(entry + 8) == y && load32(entry + 12) == z) {
+            return f64_from_bits(load64(entry + 16));
+        }
+        let result: f64 = self.sample(node.a, x, y, z);
+        store32(entry, 1); store32(entry + 4, x); store32(entry + 8, y); store32(entry + 12, z);
+        store64(entry + 16, to_u64(f64_bits(result)));
+        return result;
+    }
+
+    fn spline(node: DensityNode, x: i32, y: i32, z: i32) -> f64 {
+        let coordinate: f64 = binary32(self.sample(node.a, x, y, z));
+        let high: i32 = node.b;
+        while (high < node.b + node.c && coordinate >= self.points[high].location) { high++; }
+        if (high == node.b || high == node.b + node.c) {
+            if (high != node.b) { high--; }
+            let end: SplinePoint = self.points[high];
+            return binary32(self.sample(end.value, x, y, z) + binary32(end.derivative * binary32(coordinate - end.location)));
+        }
+        let left: SplinePoint = self.points[high - 1];
+        let right: SplinePoint = self.points[high];
+        let span: f64 = binary32(right.location - left.location);
+        let t: f64 = binary32(binary32(coordinate - left.location) / span);
+        let a: f64 = self.sample(left.value, x, y, z);
+        let b: f64 = self.sample(right.value, x, y, z);
+        let delta: f64 = binary32(b - a);
+        let slope_a: f64 = binary32(binary32(left.derivative * span) - delta);
+        let slope_b: f64 = binary32(binary32(-right.derivative * span) + delta);
+        let base: f64 = binary32(a + binary32(t * delta));
+        let slope: f64 = binary32(slope_a + binary32(t * binary32(slope_b - slope_a)));
+        return binary32(base + binary32(binary32(t * binary32(1.0 - t)) * slope));
+    }
+
+    pub fn sample(id: i32, x: i32, y: i32, z: i32) -> f64 {
+        let node: DensityNode = self.nodes[id];
+        let kind: i32 = node.kind;
+        if (kind == 0) { return node.low; }
+        if (kind == 22) { return self.interpolated(id, node.a, x, y, z); }
+        if (kind >= 23 && kind <= 25) { return self.memoized(id, node, x, y, z); }
+        if (kind == 20) { return self.spline(node, x, y, z); }
+        if (kind == 21) { return self.old_noise.sample(to_f64(x), to_f64(y), to_f64(z)); }
+        if (kind == 13) {
+            let t: f64 = terrain_clamp(to_f64(y - node.a) / to_f64(node.b - node.a), 0.0, 1.0);
+            return terrain_lerp(t, node.low, node.high);
+        }
+        if (kind == 15) { return self.noises[node.a].sample(to_f64(x) * node.low, to_f64(y) * node.high, to_f64(z) * node.low); }
+        if (kind == 16) { return 4.0 * self.noises[node.a].sample(to_f64(x) * 0.25, 0.0, to_f64(z) * 0.25); }
+        if (kind == 17) { return 4.0 * self.noises[node.a].sample(to_f64(z) * 0.25, to_f64(x) * 0.25, 0.0); }
+        if (kind == 18) {
+            return self.noises[node.a].sample(to_f64(x) * node.low + self.sample(node.b, x, y, z),
+                to_f64(y) * node.high + self.sample(node.c, x, y, z), to_f64(z) * node.low + self.sample(node.d, x, y, z));
+        }
+        if (kind == 26) {
+            let high: i32 = to_i32(terrain_floor(self.sample(node.b, x, y, z) / to_f64(node.d))) * node.d;
+            if (high < node.c) { return to_f64(node.c); }
+            for (let yy: i32 = high; yy >= node.c; yy -= node.d) {
+                if (self.sample(node.a, x, yy, z) > 0.0) { return to_f64(yy); }
+            }
+            return to_f64(node.c);
+        }
+        let a: f64 = self.sample(node.a, x, y, z);
+        if (kind == 14) {
+            if (a >= node.low && a < node.high) { return self.sample(node.b, x, y, z); }
+            return self.sample(node.c, x, y, z);
+        }
+        if (kind == 19) {
+            let scale: f64 = rarity_scale(a, node.c);
+            return scale * terrain_abs(self.noises[node.b].sample(to_f64(x) / scale, to_f64(y) / scale, to_f64(z) / scale));
+        }
+        if (kind == 1) { return a + self.sample(node.b, x, y, z); }
+        if (kind == 2) {
+            if (a == 0.0) { return 0.0; }
+            return a * self.sample(node.b, x, y, z);
+        }
+        if (kind == 3 || kind == 4) {
+            let b: f64 = self.sample(node.b, x, y, z);
+            if ((kind == 3 && a > b) || (kind == 4 && a < b)) { return b; }
+            return a;
+        }
+        if (kind == 5) { return terrain_abs(a); }
+        if (kind == 6) { return a * a; }
+        if (kind == 7) { return a * a * a; }
+        if (kind == 8 && a < 0.0) { return a * 0.5; }
+        if (kind == 9 && a < 0.0) { return a * 0.25; }
+        if (kind == 10) {
+            let d: f64 = terrain_clamp(a, -1.0, 1.0);
+            return d * 0.5 - d * d * d / 24.0;
+        }
+        if (kind == 11) { return 1.0 / a; }
+        if (kind == 12) { return terrain_clamp(a, node.low, node.high); }
+        return a;
+    }
+}
+
+fn rarity_scale(value: f64, mapper: i32) -> f64 {
+    if (mapper == 0) {
+        if (value < -0.5) { return 0.75; }
+        if (value < 0.0) { return 1.0; }
+        if (value < 0.5) { return 1.5; }
+        return 2.0;
+    }
+    if (value < -0.75) { return 0.5; }
+    if (value < -0.5) { return 0.75; }
+    if (value < 0.5) { return 1.0; }
+    if (value < 0.75) { return 2.0; }
+    return 3.0;
+}

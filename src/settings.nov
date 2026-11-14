@@ -14,6 +14,7 @@ class Settings {
     pub let difficulty: i32 = 1;
     pub let seed: i64 = 0;
     pub let world: str = "world";
+    pub let level_type: str = "";
     pub let source: str = "";
     pub let error: str = "";
 
@@ -22,7 +23,8 @@ class Settings {
             self.error = write_all_text(path,
                 "server-ip=127.0.0.1\nserver-port=25565\nmotd=GolemMC\nmax-players=20\n" +
                 "view-distance=3\ngamemode=creative\ndifficulty=easy\nlevel-seed=0\n" +
-                "level-name=world\nvanilla-snapshot=\nonline-mode=false\n");
+                "level-name=world\nlevel-type=minecraft:normal\nvanilla-snapshot=\nonline-mode=false\n");
+            self.level_type = "minecraft:normal";
             return;
         }
         let file: FileTextResult = read_all_text(path);
@@ -57,6 +59,10 @@ class Settings {
             }
         }
         if (key == "vanilla-worldgen" && value != "") { self.error = "The Java worldgen worker was removed. Remove vanilla-worldgen and use a new level-name for native generation."; }
+        if (key == "level-type") {
+            if (value != "minecraft:normal" && value != "minecraft:flat") { self.error = "level-type must be minecraft:normal or minecraft:flat"; }
+            self.level_type = value;
+        }
         if (key == "vanilla-snapshot") { self.source = value; }
         if (key == "online-mode" && value != "false") { self.error = "online-mode requires Mojang authentication and is unavailable"; }
         if (key == "gamemode") {
